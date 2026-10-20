@@ -1,0 +1,3445 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check icon
+      run: |
+        pwd
+        ls -la
+        file icon.png
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+    - name: Generate project
+      run: |
+        mkdir -p "$(dirname 'StretchBox/app/build.gradle.kts')"
+        cat > 'StretchBox/app/build.gradle.kts' <<'STRETCH_EOF'
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+
+        android {
+            namespace = "com.example.stretchbox"
+            compileSdk = 34
+
+            defaultConfig {
+                applicationId = "com.example.stretchbox"
+                minSdk = 30
+                targetSdk = 34
+                versionCode = 1
+                versionName = "1.0"
+            }
+
+            buildFeatures { aidl = true }
+
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = "17" }
+        }
+
+        dependencies {
+            implementation("dev.rikka.shizuku:api:13.1.5")
+            implementation("dev.rikka.shizuku:provider:13.1.5")
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/AndroidManifest.xml')"
+        cat > 'StretchBox/app/src/main/AndroidManifest.xml' <<'STRETCH_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+            <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+            <!-- 允许列出可启动的应用（不需要 QUERY_ALL_PACKAGES） -->
+            <queries>
+                <intent>
+                    <action android:name="android.intent.action.MAIN" />
+                    <category android:name="android.intent.category.LAUNCHER" />
+                </intent>
+            </queries>
+
+            <application
+                android:allowBackup="false"
+                android:icon="@drawable/icon"
+                android:label="卡了游戏助手"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                <activity
+                    android:name=".MainActivity"
+                    android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+
+                <activity
+                    android:name=".StretchActivity"
+                    android:exported="false"
+                    android:launchMode="singleTask"
+                    android:screenOrientation="sensorLandscape"
+                    android:resizeableActivity="true"
+                    android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density" />
+
+                <provider
+                    android:name="rikka.shizuku.ShizukuProvider"
+                    android:authorities="${applicationId}.shizuku"
+                    android:enabled="true"
+                    android:exported="true"
+                    android:multiprocess="false"
+                    android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+            </application>
+        </manifest>
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/aidl/com/example/stretchbox/IStretchService.aidl')"
+        cat > 'StretchBox/app/src/main/aidl/com/example/stretchbox/IStretchService.aidl' <<'STRETCH_EOF'
+        package com.example.stretchbox;
+
+        import android.view.Surface;
+        import android.view.MotionEvent;
+
+        /** 运行在 Shizuku（shell 权限）进程中的服务接口 */
+        interface IStretchService {
+            /** Shizuku 要求的销毁方法，事务号固定 */
+            void destroy() = 16777114;
+
+            /** 创建（或复用）虚拟屏，画面输出到 surface，返回 displayId；失败抛异常 */
+            int createDisplay(int width, int height, int dpi, float refreshRate, in Surface surface) = 1;
+            void resizeDisplay(int width, int height, int dpi) = 2;
+            /** surface 可为 null（暂停输出） */
+            void setSurface(in Surface surface) = 3;
+            void releaseDisplay() = 4;
+
+            /** 把应用启动到指定虚拟屏，返回 am 输出 */
+            String launch(String pkg, int displayId, boolean forceStop) = 5;
+
+            oneway void injectTouch(int displayId, in MotionEvent event) = 6;
+            oneway void injectKey(int displayId, int keyCode) = 7;
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/MainActivity.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/MainActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.content.Context
+        import android.content.Intent
+        import android.graphics.Typeface
+        import android.os.Bundle
+        import android.view.Gravity
+        import android.view.View
+        import android.view.ViewGroup
+        import android.widget.ArrayAdapter
+        import android.widget.Button
+        import android.widget.CheckBox
+        import android.widget.EditText
+        import android.widget.HorizontalScrollView
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import android.text.InputType
+        import android.widget.AdapterView
+        import rikka.shizuku.Shizuku
+        import kotlin.math.max
+        import kotlin.math.min
+        import kotlin.math.roundToInt
+
+        class MainActivity : Activity() {
+
+            private lateinit var statusText: TextView
+            private lateinit var statusBtn: Button
+            private lateinit var gameSpinner: Spinner
+            private lateinit var etW: EditText
+            private lateinit var etH: EditText
+            private lateinit var etDpi: EditText
+            private lateinit var cbForceStop: CheckBox
+            private lateinit var hzSpinner: Spinner
+            private lateinit var cbShowMenu: CheckBox
+            private lateinit var cbGyroFix: CheckBox
+            private lateinit var cbGyroInvert: CheckBox
+            private lateinit var cbFlipV: CheckBox
+            private lateinit var cbFlipH: CheckBox
+            private lateinit var cbGyroDiag: CheckBox
+            private var apps: List<Pair<String, String>> = emptyList() // pkg to label
+            private var shortSide = 1080
+            private var longSide = 1920
+            private var baseDpi = 420
+
+            private val binderListener = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+            private val deadListener = Shizuku.OnBinderDeadListener { runOnUiThread { refresh() } }
+            private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> runOnUiThread { refresh() } }
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                                val crashPrefs = getSharedPreferences("crash", Context.MODE_PRIVATE)
+                Thread.setDefaultUncaughtExceptionHandler { _, e ->
+                    crashPrefs.edit().putString("log", android.util.Log.getStackTraceString(e)).commit()
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+                crashPrefs.getString("log", null)?.let {
+                    crashPrefs.edit().remove("log").apply()
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("上次崩溃日志")
+                        .setMessage(it.take(4000))
+                        .setPositiveButton("确定", null)
+                        .show()
+                }
+                                try {
+                    val am = getSystemService(android.app.ActivityManager::class.java)
+                    val info = am.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull()
+                    if (info != null && info.timestamp > crashPrefs.getLong("exitTs", 0L)) {
+                        crashPrefs.edit().putLong("exitTs", info.timestamp).apply()
+                        android.app.AlertDialog.Builder(this)
+                            .setTitle("上次退出原因")
+                            .setMessage("reason=${info.reason} status=${info.status}\n${info.description}")
+                            .setPositiveButton("确定", null)
+                            .show()
+                    }
+                } catch (_: Throwable) {}
+                val b = windowManager.currentWindowMetrics.bounds
+                shortSide = min(b.width(), b.height())
+                longSide = max(b.width(), b.height())
+                baseDpi = resources.displayMetrics.densityDpi
+
+                buildUi()
+                loadApps()
+                restorePrefs()
+
+                Shizuku.addBinderReceivedListenerSticky(binderListener)
+                Shizuku.addBinderDeadListener(deadListener)
+                Shizuku.addRequestPermissionResultListener(permListener)
+            }
+
+            override fun onResume() { super.onResume(); refresh() }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                Shizuku.removeBinderReceivedListener(binderListener)
+                Shizuku.removeBinderDeadListener(deadListener)
+                Shizuku.removeRequestPermissionResultListener(permListener)
+            }
+
+            // ---------------- UI ----------------
+
+            private fun label(text: String) = TextView(this).apply {
+                this.text = text; textSize = 14f; setTypeface(typeface, Typeface.BOLD)
+                setPadding(0, dp(16), 0, dp(4))
+            }
+
+            private fun numberField(hint: String) = EditText(this).apply {
+                this.hint = hint; inputType = InputType.TYPE_CLASS_NUMBER; setSingleLine()
+            }
+
+            private fun buildUi() {
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(20), dp(40), dp(20), dp(24))
+                }
+
+                root.addView(TextView(this).apply { text = "卡了游戏助手"; textSize = 26f; setTypeface(typeface, Typeface.BOLD) })
+
+                statusText = TextView(this).apply { setPadding(0, dp(12), 0, dp(4)) }
+                statusBtn = Button(this).apply { setOnClickListener { onStatusClick() } }
+                root.addView(statusText); root.addView(statusBtn)
+
+                root.addView(label("选择游戏"))
+                gameSpinner = Spinner(this)
+                root.addView(gameSpinner)
+
+                root.addView(label("虚拟屏比例（游戏看到的分辨率，会被拉伸铺满屏幕）"))
+                val presets = listOf(
+                    "4:3" to 4.0 / 3, "16:10" to 1.6, "16:9" to 16.0 / 9,
+                    "18:9" to 2.0, "19.5:9" to 19.5 / 9, "21:9" to 21.0 / 9, "1:1" to 1.0
+                )
+                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                presets.forEach { (name, ratio) ->
+                    row.addView(Button(this).apply {
+                        text = name; isAllCaps = false
+                        setOnClickListener { applyPreset(ratio) }
+                    })
+                }
+                root.addView(HorizontalScrollView(this).apply { addView(row) })
+
+                val wh = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                etW = numberField("宽 px"); etH = numberField("高 px"); etDpi = numberField("DPI")
+                listOf(etW, etH, etDpi).forEach {
+                    wh.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                }
+                root.addView(wh)
+
+                cbForceStop = CheckBox(this).apply { text = "启动前强制停止该游戏（推荐，避免它留在主屏）"; isChecked = true }
+                root.addView(cbForceStop)
+
+                root.addView(label("虚拟屏帧率（请求值，0 = 自动跟随真屏）"))
+                hzSpinner = Spinner(this)
+                hzSpinner.adapter = ArrayAdapter(
+                    this, android.R.layout.simple_spinner_dropdown_item,
+                    listOf("自动（跟随真屏）", "120 Hz", "144 Hz")
+                )
+                root.addView(hzSpinner)
+                cbShowMenu = CheckBox(this).apply { text = "容器内显示右上角菜单按钮"; isChecked = true }
+                cbGyroFix = CheckBox(this).apply { text = "陀螺仪修复模式（竖屏创建虚拟屏，修复轴错位）"; isChecked = prefs.getBoolean("gyroFix", false) }
+                root.addView(cbGyroFix)
+                cbGyroInvert = CheckBox(this).apply { text = "陀螺仪方向反转（修复后视角方向反了就勾选）" }
+                root.addView(cbGyroInvert)
+                cbFlipV = CheckBox(this).apply { text = "画面上下翻转（画面倒了就勾选）" }
+                root.addView(cbFlipV)
+                cbFlipH = CheckBox(this).apply { text = "画面左右翻转" }
+                root.addView(cbFlipH)
+                cbGyroDiag = CheckBox(this).apply { text = "启动后显示陀螺仪诊断窗口（调试用）" }
+                root.addView(cbGyroDiag)
+                                root.addView(TextView(this).apply { text = "画面调节（进游戏后生效，想改就回到这里改）"; textSize = 16f; setPadding(0, dp(16), 0, 0) })
+                val adjSeeks = ArrayList<android.widget.SeekBar>()
+                val adjNames = arrayOf("明度", "对比度", "饱和度", "色温")
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = adjNames[i] })
+                    val sb = android.widget.SeekBar(this).apply {
+                        max = 200
+                        progress = ((prefs.getFloat("adj$i", 0f) + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
+                                prefs.edit().putFloat("adj$i", p / 100f - 1f).apply()
+                            }
+                            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+                            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+                        })
+                    }
+                    adjSeeks.add(sb)
+                    root.addView(sb)
+                }
+                root.addView(TextView(this).apply { text = "锐化（画面发糊时往右拉）" })
+                root.addView(android.widget.SeekBar(this).apply {
+                    max = 100
+                    progress = (prefs.getFloat("adj4", 0f) * 100).roundToInt()
+                    setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
+                            prefs.edit().putFloat("adj4", p / 100f).apply()
+                        }
+                        override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+                        override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+                    })
+                })
+                root.addView(TextView(this).apply { text = "滤镜" })
+                val filterSp = Spinner(this)
+                filterSp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳"))
+                var filterInit = true
+                filterSp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        if (filterInit) { filterInit = false; return }
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) adjSeeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(filterSp)
+                root.addView(Button(this).apply {
+                    text = "进入容器并启动"; textSize = 16f
+                    setOnClickListener { start() }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)).apply { topMargin = dp(20) })
+
+                root.addView(TextView(this).apply {
+                text = "提示：容器里没有按钮，用系统手势退出即可；所有设置都在本页。"
+                text = "反馈bug，获取最新版请加Q群:1130659255"
+                    textSize = 12f; gravity = Gravity.START; setPadding(0, dp(12), 0, 0)
+                })
+
+                setContentView(ScrollView(this).apply { addView(root) })
+            }
+
+            private fun applyPreset(ratio: Double) {
+                val w = longSide.coerceAtMost(3200)
+                val h = (w / ratio / 2).roundToInt() * 2
+                etW.setText(w.toString()); etH.setText(h.toString()); etDpi.setText(baseDpi.toString())
+            }
+
+            private fun loadApps() {
+                val pm = packageManager
+                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                apps = pm.queryIntentActivities(intent, 0)
+                    .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                    .filter { it.first != packageName }
+                    .distinctBy { it.first }
+                    .sortedBy { it.second.lowercase() }
+                gameSpinner.adapter = ArrayAdapter(
+                    this, android.R.layout.simple_spinner_dropdown_item,
+                    apps.map { "${it.second}  (${it.first})" }
+                )
+                gameSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {}
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+            }
+
+            private fun restorePrefs() {
+                val pkg = prefs.getString("pkg", null)
+                apps.indexOfFirst { it.first == pkg }.takeIf { it >= 0 }?.let { gameSpinner.setSelection(it) }
+                val w = prefs.getInt("w", 0)
+                if (w > 0) {
+                    etW.setText(w.toString()); etH.setText(prefs.getInt("h", shortSide).toString())
+                    etDpi.setText(prefs.getInt("dpi", baseDpi).toString())
+                } else applyPreset(16.0 / 9)
+                cbForceStop.isChecked = prefs.getBoolean("force", true)
+                hzSpinner.setSelection(
+                    listOf(0, 120, 144).indexOf(prefs.getInt("hz", 0)).takeIf { it >= 0 } ?: 0
+                )
+                cbShowMenu.isChecked = prefs.getBoolean("showMenu", true)
+                cbGyroFix.isChecked = prefs.getBoolean("gyroFix", false)
+                                cbGyroInvert.isChecked = prefs.getBoolean("gyroInvert", false)
+                cbFlipV.isChecked = prefs.getBoolean("flipV", false)
+                cbFlipH.isChecked = prefs.getBoolean("flipH", false)
+                cbGyroDiag.isChecked = prefs.getBoolean("gyroDiag", true)
+            }
+
+            // ---------------- Shizuku 状态 ----------------
+
+            private fun refresh() {
+                when (ServiceClient.status()) {
+                    ServiceClient.Status.SHIZUKU_NOT_RUNNING -> {
+                        statusText.text = "Shizuku 未运行，请先在 Shizuku App 中启动（无线调试 / ADB / Root）"
+                        statusBtn.text = "重新检测"
+                    }
+                    ServiceClient.Status.NO_PERMISSION -> {
+                        statusText.text = "Shizuku 已运行，但本应用尚未授权"
+                        statusBtn.text = "授权"
+                    }
+                    ServiceClient.Status.READY -> {
+                        statusText.text = "Shizuku 已连接 ✔"
+                        statusBtn.text = "刷新"
+                        ServiceClient.bind(this)
+                    }
+                }
+            }
+
+            private fun onStatusClick() {
+                if (ServiceClient.status() == ServiceClient.Status.NO_PERMISSION) ServiceClient.requestPermission()
+                else refresh()
+            }
+
+            // ---------------- 启动 ----------------
+
+            private fun start() {
+                if (ServiceClient.status() != ServiceClient.Status.READY) {
+                    Toast.makeText(this, "请先连接并授权 Shizuku", Toast.LENGTH_SHORT).show(); return
+                }
+                val w = etW.text.toString().toIntOrNull()
+                val h = etH.text.toString().toIntOrNull()
+                val dpi = etDpi.text.toString().toIntOrNull()
+                val pos = gameSpinner.selectedItemPosition
+                if (w == null || h == null || dpi == null || w < 200 || h < 200 || pos < 0) {
+                    Toast.makeText(this, "请填写有效的宽、高、DPI 并选择游戏", Toast.LENGTH_SHORT).show(); return
+                }
+                val pkg = apps[pos].first
+                val hz = listOf(0, 120, 144)[hzSpinner.selectedItemPosition.coerceIn(0, 2)]
+                prefs.edit().putString("pkg", pkg).putInt("w", w).putInt("h", h).putInt("dpi", dpi)
+                    .putInt("hz", hz)
+                    .putBoolean("showMenu", cbShowMenu.isChecked)
+                    .putBoolean("gyroFix", cbGyroFix.isChecked)
+                    .putBoolean("gyroInvert", cbGyroInvert.isChecked).putBoolean("flipV", cbFlipV.isChecked).putBoolean("flipH", cbFlipH.isChecked).putBoolean("gyroDiag", cbGyroDiag.isChecked)
+                    .putBoolean("force", cbForceStop.isChecked).apply()
+
+                startActivity(Intent(this, StretchActivity::class.java).apply {
+                    putExtra(StretchActivity.EXTRA_PKG, pkg)
+                    putExtra(StretchActivity.EXTRA_W, w)
+                    putExtra(StretchActivity.EXTRA_H, h)
+                    putExtra(StretchActivity.EXTRA_DPI, dpi)
+                    putExtra(StretchActivity.EXTRA_HZ, hz)
+                    putExtra(StretchActivity.EXTRA_SHOW_MENU, cbShowMenu.isChecked)
+                    putExtra(StretchActivity.EXTRA_GYRO_FIX, cbGyroFix.isChecked)
+                    putExtra(StretchActivity.EXTRA_FORCE_STOP, cbForceStop.isChecked)
+                })
+            }
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/ServiceClient.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/ServiceClient.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.content.ComponentName
+        import android.content.Context
+        import android.content.ServiceConnection
+        import android.content.pm.PackageManager
+        import android.os.IBinder
+        import com.example.stretchbox.service.StretchService
+        import rikka.shizuku.Shizuku
+        import java.util.concurrent.CopyOnWriteArrayList
+
+        /** App 进程侧：管理 Shizuku 授权 & UserService 的绑定 */
+        object ServiceClient {
+
+            enum class Status { SHIZUKU_NOT_RUNNING, NO_PERMISSION, READY }
+
+            const val REQ_CODE = 1001
+
+            @Volatile var service: IStretchService? = null
+                private set
+            @Volatile private var binding = false
+            private val waiters = CopyOnWriteArrayList<(IStretchService) -> Unit>()
+
+            private val conn = object : ServiceConnection {
+                override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                    binding = false
+                    if (!binder.pingBinder()) return
+                    val s = IStretchService.Stub.asInterface(binder)
+                    service = s
+                    waiters.forEach { it(s) }
+                    waiters.clear()
+                }
+
+                override fun onServiceDisconnected(name: ComponentName) {
+                    service = null
+                }
+            }
+
+            fun status(): Status = try {
+                when {
+                    !Shizuku.pingBinder() -> Status.SHIZUKU_NOT_RUNNING
+                    Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED -> Status.NO_PERMISSION
+                    else -> Status.READY
+                }
+            } catch (t: Throwable) {
+                Status.SHIZUKU_NOT_RUNNING
+            }
+
+            fun requestPermission() {
+                try { Shizuku.requestPermission(REQ_CODE) } catch (_: Throwable) {}
+            }
+
+            fun bind(ctx: Context) {
+                if (service != null || binding || status() != Status.READY) return
+                binding = true
+                val args = Shizuku.UserServiceArgs(ComponentName(ctx.packageName, StretchService::class.java.name))
+                    .daemon(false)               // App 退出时 shell 进程一并退出，虚拟屏随之回收
+                    .processNameSuffix("stretch")
+                    .version(1)
+                try { Shizuku.bindUserService(args, conn) } catch (t: Throwable) { binding = false }
+            }
+
+            /** 服务已连接就立即回调，否则排队等待（回调在主线程） */
+            fun whenReady(cb: (IStretchService) -> Unit) {
+                val s = service
+                if (s != null) cb(s) else waiters.add(cb)
+            }
+        }
+        STRETCH_EOF
+                mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.app.AlertDialog
+        import android.content.Context
+        import android.graphics.Color
+        import android.opengl.GLSurfaceView
+        import android.os.Bundle
+        import android.view.Gravity
+        import android.view.InputDevice
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+        import android.view.Surface
+        import android.view.View
+        import android.view.ViewGroup
+        import android.view.WindowInsets
+        import android.view.WindowManager
+        import android.widget.AdapterView
+        import android.widget.ArrayAdapter
+        import android.widget.FrameLayout
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.SeekBar
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import kotlin.concurrent.thread
+        import kotlin.math.roundToInt
+
+        /**
+         * 容器界面：
+         *  - GLSurfaceView 铺满全屏，用 OpenGL 把虚拟屏画面画出来（缓冲区比例 ≠ 屏幕比例 ⇒ 强制拉伸）
+         *  - GL 渲染支持明度/对比度/饱和度/色温和滤镜
+         *  - 触摸按 虚拟屏尺寸 / 控件尺寸 缩放后注入虚拟屏
+         */
+        class StretchActivity : Activity() {
+
+            companion object {
+                const val EXTRA_PKG = "pkg"
+                const val EXTRA_W = "w"
+                const val EXTRA_H = "h"
+                const val EXTRA_DPI = "dpi"
+                const val EXTRA_HZ = "hz"
+                const val EXTRA_FORCE_STOP = "force"
+                const val EXTRA_SHOW_MENU = "showMenu"
+                const val EXTRA_GYRO_FIX = "gyroFix"
+            }
+
+            private lateinit var glView: GLSurfaceView
+            private lateinit var renderer: StretchRenderer
+            private lateinit var pkg: String
+            private var vdW = 1920
+            private var vdH = 1080
+            private var dpi = 420
+            private var hz = 0
+            private var forceStop = true
+            private var showMenuBtn = true
+            private var gyroFix = false
+
+            @Volatile private var displayId = -1
+            private var launched = false
+            private var outputSurface: Surface? = null
+
+            /** 明度/对比度/饱和度/色温，范围 -1..1 */
+            private val colorAdj = floatArrayOf(0f, 0f, 0f, 0f)
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                pkg = intent.getStringExtra(EXTRA_PKG) ?: run { finish(); return }
+                vdW = intent.getIntExtra(EXTRA_W, vdW)
+                vdH = intent.getIntExtra(EXTRA_H, vdH)
+                dpi = intent.getIntExtra(EXTRA_DPI, dpi)
+                hz = intent.getIntExtra(EXTRA_HZ, 0)
+                forceStop = intent.getBooleanExtra(EXTRA_FORCE_STOP, true)
+                showMenuBtn = intent.getBooleanExtra(EXTRA_SHOW_MENU, true)
+                gyroFix = intent.getBooleanExtra(EXTRA_GYRO_FIX, false)
+
+                for (i in 0..3) colorAdj[i] = prefs.getFloat("adj$i", 0f)
+
+                goImmersive()
+
+                renderer = StretchRenderer(vdW, vdH) { s -> onOutputSurfaceReady(s) }
+                renderer.setFlip(if (gyroFix) 1f else 0f)
+                glView = GLSurfaceView(this).apply {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                    setOnTouchListener { v, ev -> forwardTouch(v, ev); true }
+                }
+                renderer.setView(glView)
+
+                val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                root.addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                if (showMenuBtn) {
+                    val d = resources.displayMetrics.density
+                    val menu = TextView(this).apply {
+                        text = "⋮"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                        setBackgroundColor(0x55000000); alpha = 0.5f
+                        setOnClickListener { showMenu() }
+                    }
+                    root.addView(menu, FrameLayout.LayoutParams((40 * d).roundToInt(), (40 * d).roundToInt(),
+                        Gravity.TOP or Gravity.END).apply {
+                        topMargin = (8 * d).roundToInt(); rightMargin = (8 * d).roundToInt()
+                    })
+                }
+
+                setContentView(root)
+                ServiceClient.bind(this)
+            }
+
+            private fun goImmersive() {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    val cur = display?.mode
+                    val best = display?.supportedModes
+                        ?.filter { cur != null && it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                        ?.maxByOrNull { it.refreshRate }
+                    if (best != null) preferredDisplayModeId = best.modeId
+                }
+                window.setDecorFitsSystemWindows(false)
+                window.decorView.windowInsetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+
+            // ---------------- 虚拟屏生命周期 ----------------
+
+            private fun onOutputSurfaceReady(s: Surface) {
+                outputSurface = s
+                ServiceClient.whenReady { svc ->
+                    thread {
+                        try {
+                            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+                            val t0 = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - t0 < 3000 && (display?.refreshRate ?: 0f) < maxHz - 1f) {
+                                Thread.sleep(100)
+                            }
+                            // 陀螺仪修复模式：竖屏创建虚拟屏，让游戏按 90° 补偿传感器
+                            val dispW: Int
+                            val dispH: Int
+                            if (gyroFix) { dispW = vdH; dispH = vdW } else { dispW = vdW; dispH = vdH }
+                            displayId = svc.createDisplay(dispW, dispH, dpi, hz.toFloat(), s)
+                            if (!launched) {
+                                launched = true
+                                val out = svc.launch(pkg, displayId, forceStop)
+                                if (out.contains("Error", true) || out.startsWith("ERR") || out.startsWith("找不到"))
+                                    runOnUiThread { Toast.makeText(this, out, Toast.LENGTH_LONG).show() }
+                            }
+                        } catch (t: Throwable) {
+                            runOnUiThread { Toast.makeText(this, "创建虚拟屏失败: ${t.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+            }
+
+            override fun onResume() {
+                super.onResume()
+                glView.onResume()   // GL 重建后会再给一个新 Surface，自动重新 attach
+            }
+
+            override fun onPause() {
+                // 退到后台：只暂停输出，虚拟屏和游戏继续存活
+                thread { try { ServiceClient.service?.setSurface(null) } catch (_: Throwable) {} }
+                glView.onPause()
+                super.onPause()
+            }
+
+            // ---------------- 触摸转发 ----------------
+
+            private fun forwardTouch(v: View, ev: MotionEvent) {
+                val svc = ServiceClient.service ?: return
+                val id = displayId
+                if (id < 0 || v.width == 0 || v.height == 0) return
+
+                val sx = vdW.toFloat() / v.width
+                val sy = vdH.toFloat() / v.height
+                val n = ev.pointerCount
+                val props = Array(n) { i -> MotionEvent.PointerProperties().also { ev.getPointerProperties(i, it) } }
+                val coords = Array(n) { i ->
+                    MotionEvent.PointerCoords().also {
+                        ev.getPointerCoords(i, it)
+                        it.x = it.x * sx
+                        it.y = it.y * sy
+                        if (gyroFix) { it.x = vdW - it.x; it.y = vdH - it.y }   // 画面转了180°，触摸跟着镜像
+                    }
+                }
+                val out = MotionEvent.obtain(
+                    ev.downTime, ev.eventTime, ev.action, n, props, coords,
+                    ev.metaState, ev.buttonState, 1f, 1f, ev.deviceId, ev.edgeFlags,
+                    InputDevice.SOURCE_TOUCHSCREEN, ev.flags
+                )
+                try { svc.injectTouch(id, out) } catch (_: Throwable) {} finally { out.recycle() }
+            }
+
+            // ---------------- 菜单 / 画面调节 ----------------
+
+            private fun showMenu() {
+                AlertDialog.Builder(this)
+                    .setItems(arrayOf("画面调节（明度/对比度/滤镜）", "发送返回键", "停止并退出", "取消")) { _, which ->
+                        when (which) {
+                            0 -> showColorDialog()
+                            1 -> sendKey(KeyEvent.KEYCODE_BACK)
+                            2 -> stopAndExit()
+                        }
+                    }.show()
+            }
+
+            private fun showColorDialog() {
+                val names = arrayOf("明度", "对比度", "饱和度", "色温")
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(40, 20, 40, 0)
+                }
+                val seeks = Array(4) { i ->
+                    SeekBar(this).apply {
+                        max = 200
+                        progress = ((colorAdj[i] + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                                colorAdj[i] = p / 100f - 1f
+                                applyColors()
+                            }
+                            override fun onStartTrackingTouch(sb: SeekBar?) {}
+                            override fun onStopTrackingTouch(sb: SeekBar?) {}
+                        })
+                    }
+                }
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = names[i] })
+                    root.addView(seeks[i])
+                }
+
+                val filters = listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳")
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
+                sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) {
+                            colorAdj[i] = preset[i]
+                            seeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                        }
+                        applyColors()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(TextView(this).apply { text = "滤镜" })
+                root.addView(sp)
+
+                AlertDialog.Builder(this)
+                    .setTitle("画面调节")
+                    .setView(ScrollView(this).apply { addView(root) })
+                    .setPositiveButton("完成") { _, _ -> saveColors() }
+                    .show()
+            }
+
+            private fun applyColors() {
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                glView.requestRender()
+            }
+
+            private fun saveColors() {
+                val e = prefs.edit()
+                for (i in 0..3) e.putFloat("adj$i", colorAdj[i])
+                e.apply()
+            }
+
+            // ---------------- 按键 / 退出 ----------------
+
+            private fun sendKey(code: Int) {
+                val id = displayId; val s = ServiceClient.service ?: return
+                if (id >= 0) thread { try { s.injectKey(id, code) } catch (_: Throwable) {} }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onBackPressed() = sendKey(KeyEvent.KEYCODE_BACK)
+
+            private fun stopAndExit() {
+                val s = ServiceClient.service
+                thread {
+                    try { s?.releaseDisplay() } catch (_: Throwable) {}
+                    runOnUiThread { finish() }
+                }
+            }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                if (isFinishing) {
+                    val s = ServiceClient.service
+                    thread { try { s?.releaseDisplay() } catch (_: Throwable) {} }
+                }
+            }
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/StretchRenderer.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchRenderer.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.graphics.SurfaceTexture
+        import android.opengl.GLES11Ext
+        import android.opengl.GLES20
+        import android.opengl.GLSurfaceView
+        import android.view.Surface
+        import java.nio.ByteBuffer
+        import java.nio.ByteOrder
+        import java.nio.FloatBuffer
+        import javax.microedition.khronos.egl.EGLConfig
+        import javax.microedition.khronos.opengles.GL10
+
+        /**
+         * 用 OpenGL 把虚拟屏的 SurfaceTexture 画到全屏。
+         * 相比 TextureView 的好处：可以在片元着色器里做明度/对比度/饱和度/色温/滤镜。
+         */
+        class StretchRenderer(
+            private val bufW: Int,
+            private val bufH: Int,
+            private val onSurfaceReady: (Surface) -> Unit
+        ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
+
+            private var surfaceTexture: SurfaceTexture? = null
+            private var surface: Surface? = null
+            private var view: GLSurfaceView? = null
+            private var program = 0
+            private var texId = 0
+
+            @Volatile private var brightness = 0f
+            @Volatile private var contrast = 0f
+            @Volatile private var saturation = 0f
+            @Volatile private var warmth = 0f
+            @Volatile private var flip = 0f
+
+            private val texMatrix = FloatArray(16)
+            private val quad: FloatBuffer = newFloatBuffer(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+            private val texCoords: FloatBuffer = newFloatBuffer(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+
+            private fun newFloatBuffer(vararg v: Float): FloatBuffer =
+                ByteBuffer.allocateDirect(v.size * 4).order(ByteOrder.nativeOrder())
+                    .asFloatBuffer().apply { put(v); position(0) }
+
+            fun setView(v: GLSurfaceView) { view = v }
+
+            fun setColors(b: Float, c: Float, s: Float, w: Float) {
+                brightness = b; contrast = c; saturation = s; warmth = w
+            }
+
+            /** 1f = 把输出画面旋转180°（陀螺仪修复模式用） */
+            fun setFlip(f: Float) { flip = f }
+
+            override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+                surfaceTexture?.release()
+                surface?.release()
+                surfaceTexture = null
+                surface = null
+
+                program = buildProgram(VERT, FRAG)
+                val ids = IntArray(1)
+                GLES20.glGenTextures(1, ids, 0)
+                texId = ids[0]
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+
+                val st = SurfaceTexture(texId)
+                st.setDefaultBufferSize(bufW, bufH)
+                st.setOnFrameAvailableListener(this)
+                surfaceTexture = st
+                val s = Surface(st)
+                surface = s
+                onSurfaceReady(s)
+            }
+
+            override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+                GLES20.glViewport(0, 0, width, height)
+            }
+
+            override fun onDrawFrame(gl: GL10?) {
+                val st = surfaceTexture ?: return
+                GLES20.glClearColor(0f, 0f, 0f, 1f)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                try { st.updateTexImage() } catch (_: Throwable) { return }
+                st.getTransformMatrix(texMatrix)
+
+                GLES20.glUseProgram(program)
+                GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program, "uTexMatrix"), 1, false, texMatrix, 0)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uBrightness"), brightness)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uContrast"), contrast)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uSaturation"), saturation)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uWarmth"), warmth)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uFlip"), flip)
+
+                val aPos = GLES20.glGetAttribLocation(program, "aPos")
+                val aUV = GLES20.glGetAttribLocation(program, "aUV")
+                GLES20.glEnableVertexAttribArray(aPos)
+                GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+                GLES20.glEnableVertexAttribArray(aUV)
+                GLES20.glVertexAttribPointer(aUV, 2, GLES20.GL_FLOAT, false, 0, texCoords)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            }
+
+            override fun onFrameAvailable(st: SurfaceTexture) {
+                view?.requestRender()
+            }
+
+            private fun buildProgram(vs: String, fs: String): Int {
+                fun compile(type: Int, src: String): Int {
+                    val id = GLES20.glCreateShader(type)
+                    GLES20.glShaderSource(id, src)
+                    GLES20.glCompileShader(id)
+                    return id
+                }
+                val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+                val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
+                val p = GLES20.glCreateProgram()
+                GLES20.glAttachShader(p, v)
+                GLES20.glAttachShader(p, f)
+                GLES20.glLinkProgram(p)
+                return p
+            }
+
+            companion object {
+                private const val VERT = """
+        attribute vec4 aPos;
+        attribute vec2 aUV;
+        uniform mat4 uTexMatrix;
+        uniform float uFlip;
+        varying vec2 vUV;
+        void main() { gl_Position = uFlip > 0.5 ? -aPos : aPos; vUV = (uTexMatrix * vec4(aUV, 0.0, 1.0)).xy; }
+        """
+
+                private const val FRAG = """
+        #extension GL_OES_EGL_image_external : require
+        precision mediump float;
+        uniform samplerExternalOES sTex;
+        uniform float uBrightness;
+        uniform float uContrast;
+        uniform float uSaturation;
+        uniform float uWarmth;
+        varying vec2 vUV;
+        void main() {
+            vec4 c = texture2D(sTex, vUV);
+            vec3 rgb = c.rgb + uBrightness;
+            rgb = (rgb - 0.5) * (1.0 + uContrast) + 0.5;
+            float g = dot(rgb, vec3(0.299, 0.587, 0.114));
+            rgb = mix(vec3(g), rgb, 1.0 + uSaturation);
+            rgb.r += uWarmth * 0.12;
+            rgb.b -= uWarmth * 0.12;
+            gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+        }
+        """
+            }
+        }
+        STRETCH_EOF
+
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/service/FakeContext.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/service/FakeContext.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox.service
+
+        import android.content.Context
+        import android.content.ContextWrapper
+        import android.os.Looper
+
+        /**
+         * 在 Shizuku 的 shell 进程（不是普通 App 进程）里没有 Application Context。
+         * 这里仿照 scrcpy：手动造一个 ActivityThread，拿到 SystemContext，
+         * 再包一层，把包名伪装成 com.android.shell。
+         */
+        class FakeContext private constructor(base: Context) : ContextWrapper(base) {
+            override fun getPackageName(): String = "com.android.shell"
+            override fun getOpPackageName(): String = "com.android.shell"
+            override fun getApplicationContext(): Context = this
+
+            companion object {
+                fun create(): Context {
+                    if (Looper.myLooper() == null) {
+                        try { Looper.prepareMainLooper() } catch (e: Throwable) { Looper.prepare() }
+                    }
+                    val atClass = Class.forName("android.app.ActivityThread")
+                    var at = atClass.getDeclaredMethod("currentActivityThread").invoke(null)
+                    if (at == null) {
+                        val ctor = atClass.getDeclaredConstructor().apply { isAccessible = true }
+                        at = ctor.newInstance()
+                        atClass.getDeclaredField("sCurrentActivityThread")
+                            .apply { isAccessible = true }.set(null, at)
+                        atClass.getDeclaredField("mSystemThread")
+                            .apply { isAccessible = true }.setBoolean(at, true)
+                    }
+                    val sys = atClass.getDeclaredMethod("getSystemContext").invoke(at) as Context
+                    return FakeContext(sys)
+                }
+            }
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/service/InputInjector.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/service/InputInjector.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox.service
+
+        import android.os.IBinder
+        import android.os.SystemClock
+        import android.view.InputDevice
+        import android.view.InputEvent
+        import android.view.KeyCharacterMap
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+
+        /**
+         * 通过 IInputManager.injectInputEvent 向指定 displayId 注入事件。
+         * 只有 shell/system uid 才有 INJECT_EVENTS 权限，所以必须在 Shizuku 进程里跑。
+         */
+        class InputInjector {
+            private val iInputManager: Any
+            private val injectMethod: java.lang.reflect.Method
+            private val setDisplayId: java.lang.reflect.Method =
+                InputEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+
+            init {
+                val binder = Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String::class.java)
+                    .invoke(null, "input") as IBinder
+                iInputManager = Class.forName("android.hardware.input.IInputManager\$Stub")
+                    .getMethod("asInterface", IBinder::class.java)
+                    .invoke(null, binder)!!
+                injectMethod = Class.forName("android.hardware.input.IInputManager")
+                    .getMethod("injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType)
+            }
+
+            private fun inject(ev: InputEvent, displayId: Int) {
+                setDisplayId.invoke(ev, displayId)
+                injectMethod.invoke(iInputManager, ev, 0 /* INJECT_INPUT_EVENT_MODE_ASYNC */)
+            }
+
+            fun touch(displayId: Int, ev: MotionEvent) {
+                try {
+                    ev.source = InputDevice.SOURCE_TOUCHSCREEN
+                    inject(ev, displayId)
+                } finally {
+                    ev.recycle()
+                }
+            }
+
+            fun key(displayId: Int, keyCode: Int) {
+                val now = SystemClock.uptimeMillis()
+                for (action in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) {
+                    val e = KeyEvent(
+                        now, now, action, keyCode, 0, 0,
+                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD
+                    )
+                    inject(e, displayId)
+                }
+            }
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/app/src/main/java/com/example/stretchbox/service/StretchService.kt')"
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/service/StretchService.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox.service
+
+        import android.hardware.display.DisplayManager
+        import android.hardware.display.VirtualDisplay
+        import android.os.Build
+        import android.util.Log
+        import android.view.MotionEvent
+        import android.view.Surface
+        import com.example.stretchbox.IStretchService
+        import kotlin.system.exitProcess
+
+        /**
+         * Shizuku UserService：运行在 shell uid 的独立进程中。
+         * 职责：1) 创建虚拟屏  2) 把游戏启动到虚拟屏  3) 向虚拟屏注入触摸/按键
+         */
+        class StretchService : IStretchService.Stub() {
+
+            private companion object {
+                const val TAG = "StretchService"
+
+                // VirtualDisplay 的 flag（部分是 hidden API，数值固定）
+                const val FLAG_PUBLIC = 1 shl 0
+                const val FLAG_OWN_CONTENT_ONLY = 1 shl 3
+                const val FLAG_SUPPORTS_TOUCH = 1 shl 6
+                const val FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
+                const val FLAG_TRUSTED = 1 shl 10
+                const val FLAG_OWN_DISPLAY_GROUP = 1 shl 11
+                const val FLAG_ALWAYS_UNLOCKED = 1 shl 12
+                const val FLAG_OWN_FOCUS = 1 shl 14
+            }
+
+            private var initError: String? = null
+            private var displayManager: DisplayManager? = null
+            private var injector: InputInjector? = null
+            private var vd: VirtualDisplay? = null
+            private var prevForceResizable: String? = null
+
+            init {
+                // 构造函数在 Shizuku 的主线程执行，这里初始化 hidden API 相关对象
+                try {
+                    val ctx = FakeContext.create()
+                    val ctor = DisplayManager::class.java.getDeclaredConstructor(android.content.Context::class.java)
+                        .apply { isAccessible = true }
+                    displayManager = ctor.newInstance(ctx)
+                } catch (t: Throwable) {
+                    initError = "DisplayManager 初始化失败: $t"; Log.e(TAG, initError!!, t)
+                }
+                try {
+                    injector = InputInjector()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "InputInjector 初始化失败", t)
+                }
+            }
+
+            private fun sh(vararg cmd: String): String = try {
+                val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+                val out = p.inputStream.bufferedReader().readText()
+                p.waitFor()
+                out.trim()
+            } catch (t: Throwable) { "ERR: $t" }
+            /** Android 14+：请求高刷新率；失败返回 null，调用方会回退到普通创建方式 */
+            private fun createWithRefreshRate(
+                dm: DisplayManager, width: Int, height: Int, dpi: Int, refreshRate: Float, surface: Surface?, flags: Int
+            ): VirtualDisplay? {
+                if (Build.VERSION.SDK_INT < 34) return null
+                return try {
+                    val rate = if (refreshRate > 0f) refreshRate else (dm.getDisplay(0)?.refreshRate ?: return null)
+                    if (rate <= 60.5f) return null
+                    val bCls = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+                    val i = Int::class.javaPrimitiveType
+                    val b = bCls.getConstructor(String::class.java, i, i, i).newInstance("StretchBox", width, height, dpi)
+                    bCls.getMethod("setFlags", i).invoke(b, flags)
+                    bCls.getMethod("setSurface", Surface::class.java).invoke(b, surface)
+                    bCls.getMethod("setRequestedRefreshRate", Float::class.javaPrimitiveType).invoke(b, rate)
+                    val cfg = bCls.getMethod("build").invoke(b)
+                    val cfgCls = Class.forName("android.hardware.display.VirtualDisplayConfig")
+                    val m = DisplayManager::class.java.declaredMethods
+                        .filter { it.name == "createVirtualDisplay" && it.parameterTypes.any { p -> p == cfgCls } }
+                        .minByOrNull { it.parameterCount } ?: return null
+                    m.isAccessible = true
+                    val args = m.parameterTypes.map { if (it == cfgCls) cfg else null }.toTypedArray()
+                    m.invoke(dm, *args) as? VirtualDisplay
+                } catch (t: Throwable) {
+                    Log.e(TAG, "高刷新率创建失败，回退", t); null
+                }
+            }
+            // ---------------- 虚拟屏 ----------------
+
+            @Synchronized
+            override fun createDisplay(width: Int, height: Int, dpi: Int, refreshRate: Float, surface: Surface?): Int {
+                vd?.let { // 已存在：复用，只换 Surface / 尺寸
+                    it.surface = surface
+                    it.resize(width, height, dpi)
+                    return it.display.displayId
+                }
+                val dm = displayManager ?: throw IllegalStateException(initError ?: "DisplayManager 不可用")
+
+                var flags = FLAG_PUBLIC or FLAG_OWN_CONTENT_ONLY or
+FLAG_SUPPORTS_TOUCH or FLAG_DESTROY_CONTENT_ON_REMOVAL
+// 删掉SDK33增加的FLAG_TRUSTED，减少GPU开销，解决掉帧
+if (Build.VERSION.SDK_INT >= 33) {
+    flags = flags
+}
+
+                val d = createWithRefreshRate(dm, width, height, dpi, refreshRate, surface, flags) ?: dm.createVirtualDisplay("StretchBox", width, height, dpi, surface, flags)
+                    ?: throw IllegalStateException("createVirtualDisplay 返回 null")
+                vd = d
+
+                // 让不可缩放(resizeableActivity=false)的游戏也能铺满虚拟屏
+                prevForceResizable = sh("settings", "get", "global", "force_resizable_activities")
+                sh("settings", "put", "global", "force_resizable_activities", "1")
+                return d.display.displayId
+            }
+
+            @Synchronized
+            override fun resizeDisplay(width: Int, height: Int, dpi: Int) {
+                vd?.resize(width, height, dpi)
+            }
+
+            @Synchronized
+            override fun setSurface(surface: Surface?) {
+                vd?.surface = surface
+            }
+
+            @Synchronized
+            override fun releaseDisplay() {
+                vd?.release()
+                vd = null
+                prevForceResizable?.let {
+                    if (it == "null" || it.isEmpty()) sh("settings", "delete", "global", "force_resizable_activities")
+                    else sh("settings", "put", "global", "force_resizable_activities", it)
+                }
+                prevForceResizable = null
+            }
+
+            // ---------------- 启动游戏 ----------------
+
+            override fun launch(pkg: String, displayId: Int, forceStop: Boolean): String {
+                if (forceStop) sh("am", "force-stop", pkg)
+                val resolved = sh(
+                    "cmd", "package", "resolve-activity", "--brief",
+                    "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", pkg
+                )
+                val component = resolved.lines().map { it.trim() }.lastOrNull { it.contains('/') && !it.contains(' ') }
+                    ?: return "找不到启动 Activity: $resolved"
+                return sh("am", "start", "--display", displayId.toString(), "-n", component)
+            }
+
+            // ---------------- 输入 ----------------
+
+            override fun injectTouch(displayId: Int, event: MotionEvent) {
+                val inj = injector
+                if (inj == null) { event.recycle(); return }
+                try { inj.touch(displayId, event) } catch (t: Throwable) { Log.e(TAG, "injectTouch", t) }
+            }
+
+            override fun injectKey(displayId: Int, keyCode: Int) {
+                try { injector?.key(displayId, keyCode) } catch (t: Throwable) { Log.e(TAG, "injectKey", t) }
+            }
+
+            override fun destroy() {
+                releaseDisplay()
+                exitProcess(0)
+            }
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/build.gradle.kts')"
+        cat > 'StretchBox/build.gradle.kts' <<'STRETCH_EOF'
+        plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+        }
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/gradle.properties')"
+        cat > 'StretchBox/gradle.properties' <<'STRETCH_EOF'
+        org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+        android.useAndroidX=true
+
+
+        android.nonTransitiveRClass=true
+        kotlin.code.style=official
+        STRETCH_EOF
+        mkdir -p "$(dirname 'StretchBox/settings.gradle.kts')"
+        cat > 'StretchBox/settings.gradle.kts' <<'STRETCH_EOF'
+        pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+        }
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+        }
+        rootProject.name = "StretchBox"
+        include(":app")
+        STRETCH_EOF
+        
+    - name: Prepare icon
+      run: |  
+        cat > 'StretchBox/app/src/main/aidl/com/example/stretchbox/IStretchService.aidl' <<'STRETCH_EOF'
+        package com.example.stretchbox;
+
+        import android.view.Surface;
+        import android.view.MotionEvent;
+
+        /** 运行在 Shizuku（shell 权限）进程中的服务接口 */
+        interface IStretchService {
+            /** Shizuku 要求的销毁方法，事务号固定 */
+            void destroy() = 16777114;
+
+            /** 创建（或复用）虚拟屏，画面输出到 surface，返回 displayId；失败抛异常 */
+            int createDisplay(int width, int height, int dpi, float refreshRate, in Surface surface) = 1;
+            void resizeDisplay(int width, int height, int dpi) = 2;
+            /** surface 可为 null（暂停输出） */
+            void setSurface(in Surface surface) = 3;
+            void releaseDisplay() = 4;
+
+            /** 把应用启动到指定虚拟屏，返回 am 输出 */
+            String launch(String pkg, int displayId, boolean forceStop) = 5;
+
+            oneway void injectTouch(int displayId, in MotionEvent event) = 6;
+            oneway void injectKey(int displayId, int keyCode) = 7;
+
+            /** 创建虚拟屏之前调用：虚拟屏内容是否随旋转输出（陀螺仪修复模式用） */
+            void configure(boolean rotatesWithContent) = 8;
+            /** 锁定虚拟屏的旋转方向（0..3），返回命令输出 */
+            String setDisplayRotation(int displayId, int rotation) = 9;
+        }
+        STRETCH_EOF
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/service/StretchService.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox.service
+
+        import android.hardware.display.DisplayManager
+        import android.hardware.display.VirtualDisplay
+        import android.os.Build
+        import android.util.Log
+        import android.view.MotionEvent
+        import android.view.Surface
+        import com.example.stretchbox.IStretchService
+        import kotlin.system.exitProcess
+
+        /**
+         * Shizuku UserService：运行在 shell uid 的独立进程中。
+         * 职责：1) 创建虚拟屏  2) 把游戏启动到虚拟屏  3) 向虚拟屏注入触摸/按键
+         */
+        class StretchService : IStretchService.Stub() {
+
+            private companion object {
+                const val TAG = "StretchService"
+
+                // VirtualDisplay 的 flag（部分是 hidden API，数值固定）
+                const val FLAG_PUBLIC = 1 shl 0
+                const val FLAG_OWN_CONTENT_ONLY = 1 shl 3
+                const val FLAG_SUPPORTS_TOUCH = 1 shl 6
+                const val FLAG_ROTATES_WITH_CONTENT = 1 shl 7
+                const val FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
+                const val FLAG_TRUSTED = 1 shl 10
+                const val FLAG_OWN_DISPLAY_GROUP = 1 shl 11
+                const val FLAG_ALWAYS_UNLOCKED = 1 shl 12
+                const val FLAG_OWN_FOCUS = 1 shl 14
+            }
+
+            private var initError: String? = null
+            private var displayManager: DisplayManager? = null
+            private var injector: InputInjector? = null
+            private var vd: VirtualDisplay? = null
+            private var prevForceResizable: String? = null
+            private var rotatesWithContent = false
+
+            init {
+                // 构造函数在 Shizuku 的主线程执行，这里初始化 hidden API 相关对象
+                try {
+                    val ctx = FakeContext.create()
+                    val ctor = DisplayManager::class.java.getDeclaredConstructor(android.content.Context::class.java)
+                        .apply { isAccessible = true }
+                    displayManager = ctor.newInstance(ctx)
+                } catch (t: Throwable) {
+                    initError = "DisplayManager 初始化失败: $t"; Log.e(TAG, initError!!, t)
+                }
+                try {
+                    injector = InputInjector()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "InputInjector 初始化失败", t)
+                }
+            }
+
+            private fun sh(vararg cmd: String): String = try {
+                val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+                val out = p.inputStream.bufferedReader().readText()
+                p.waitFor()
+                out.trim()
+            } catch (t: Throwable) { "ERR: $t" }
+            /** Android 14+：请求高刷新率；失败返回 null，调用方会回退到普通创建方式 */
+            private fun createWithRefreshRate(
+                dm: DisplayManager, width: Int, height: Int, dpi: Int, refreshRate: Float, surface: Surface?, flags: Int
+            ): VirtualDisplay? {
+                if (Build.VERSION.SDK_INT < 34) return null
+                return try {
+                    val rate = if (refreshRate > 0f) refreshRate else (dm.getDisplay(0)?.refreshRate ?: return null)
+                    if (rate <= 60.5f) return null
+                    val bCls = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+                    val i = Int::class.javaPrimitiveType
+                    val b = bCls.getConstructor(String::class.java, i, i, i).newInstance("StretchBox", width, height, dpi)
+                    bCls.getMethod("setFlags", i).invoke(b, flags)
+                    bCls.getMethod("setSurface", Surface::class.java).invoke(b, surface)
+                    bCls.getMethod("setRequestedRefreshRate", Float::class.javaPrimitiveType).invoke(b, rate)
+                    val cfg = bCls.getMethod("build").invoke(b)
+                    val cfgCls = Class.forName("android.hardware.display.VirtualDisplayConfig")
+                    val m = DisplayManager::class.java.declaredMethods
+                        .filter { it.name == "createVirtualDisplay" && it.parameterTypes.any { p -> p == cfgCls } }
+                        .minByOrNull { it.parameterCount } ?: return null
+                    m.isAccessible = true
+                    val args = m.parameterTypes.map { if (it == cfgCls) cfg else null }.toTypedArray()
+                    m.invoke(dm, *args) as? VirtualDisplay
+                } catch (t: Throwable) {
+                    Log.e(TAG, "高刷新率创建失败，回退", t); null
+                }
+            }
+            // ---------------- 虚拟屏 ----------------
+
+            @Synchronized
+            override fun createDisplay(width: Int, height: Int, dpi: Int, refreshRate: Float, surface: Surface?): Int {
+                vd?.let { // 已存在：复用，只换 Surface / 尺寸
+                    it.surface = surface
+                    it.resize(width, height, dpi)
+                    return it.display.displayId
+                }
+                val dm = displayManager ?: throw IllegalStateException(initError ?: "DisplayManager 不可用")
+
+                var flags = FLAG_PUBLIC or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or
+                        FLAG_DESTROY_CONTENT_ON_REMOVAL
+                if (Build.VERSION.SDK_INT >= 33) {
+                    flags = flags or FLAG_TRUSTED or FLAG_OWN_DISPLAY_GROUP or FLAG_ALWAYS_UNLOCKED or FLAG_OWN_FOCUS
+                }
+
+                if (rotatesWithContent) flags = flags or FLAG_ROTATES_WITH_CONTENT
+
+                val d = createWithRefreshRate(dm, width, height, dpi, refreshRate, surface, flags) ?: dm.createVirtualDisplay("StretchBox", width, height, dpi, surface, flags)
+                    ?: throw IllegalStateException("createVirtualDisplay 返回 null")
+                vd = d
+
+                // 让不可缩放(resizeableActivity=false)的游戏也能铺满虚拟屏
+                prevForceResizable = sh("settings", "get", "global", "force_resizable_activities")
+                sh("settings", "put", "global", "force_resizable_activities", "1")
+                return d.display.displayId
+            }
+
+            override fun configure(rotatesWithContent: Boolean) {
+                this.rotatesWithContent = rotatesWithContent
+            }
+
+            override fun setDisplayRotation(displayId: Int, rotation: Int): String =
+                sh("cmd", "window", "user-rotation", "-d", displayId.toString(), "lock", rotation.toString())
+
+            @Synchronized
+            override fun resizeDisplay(width: Int, height: Int, dpi: Int) {
+                vd?.resize(width, height, dpi)
+            }
+
+            @Synchronized
+            override fun setSurface(surface: Surface?) {
+                vd?.surface = surface
+            }
+
+            @Synchronized
+            override fun releaseDisplay() {
+                vd?.release()
+                vd = null
+                prevForceResizable?.let {
+                    if (it == "null" || it.isEmpty()) sh("settings", "delete", "global", "force_resizable_activities")
+                    else sh("settings", "put", "global", "force_resizable_activities", it)
+                }
+                prevForceResizable = null
+            }
+
+            // ---------------- 启动游戏 ----------------
+
+            override fun launch(pkg: String, displayId: Int, forceStop: Boolean): String {
+                if (forceStop) sh("am", "force-stop", pkg)
+                val resolved = sh(
+                    "cmd", "package", "resolve-activity", "--brief",
+                    "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", pkg
+                )
+                val component = resolved.lines().map { it.trim() }.lastOrNull { it.contains('/') && !it.contains(' ') }
+                    ?: return "找不到启动 Activity: $resolved"
+                return sh("am", "start", "--display", displayId.toString(), "-n", component)
+            }
+
+            // ---------------- 输入 ----------------
+
+            override fun injectTouch(displayId: Int, event: MotionEvent) {
+                val inj = injector
+                if (inj == null) { event.recycle(); return }
+                try { inj.touch(displayId, event) } catch (t: Throwable) { Log.e(TAG, "injectTouch", t) }
+            }
+
+            override fun injectKey(displayId: Int, keyCode: Int) {
+                try { injector?.key(displayId, keyCode) } catch (t: Throwable) { Log.e(TAG, "injectKey", t) }
+            }
+
+            override fun destroy() {
+                releaseDisplay()
+                exitProcess(0)
+            }
+        }
+        STRETCH_EOF
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchRenderer.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.graphics.SurfaceTexture
+        import android.opengl.GLES11Ext
+        import android.opengl.GLES20
+        import android.opengl.GLSurfaceView
+        import android.view.Surface
+        import java.nio.ByteBuffer
+        import java.nio.ByteOrder
+        import java.nio.FloatBuffer
+        import javax.microedition.khronos.egl.EGLConfig
+        import javax.microedition.khronos.opengles.GL10
+
+        /**
+         * 用 OpenGL 把虚拟屏的 SurfaceTexture 画到全屏。
+         * 支持：明度/对比度/饱和度/色温、锐化、上下/左右翻转、0/90/180/270 旋转（陀螺仪修复模式用）。
+         */
+        class StretchRenderer(
+            private val bufW: Int,
+            private val bufH: Int,
+            private val onSurfaceReady: (Surface) -> Unit
+        ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
+
+            private var surfaceTexture: SurfaceTexture? = null
+            private var surface: Surface? = null
+            private var view: GLSurfaceView? = null
+            private var program = 0
+            private var texId = 0
+
+            @Volatile private var brightness = 0f
+            @Volatile private var contrast = 0f
+            @Volatile private var saturation = 0f
+            @Volatile private var warmth = 0f
+            @Volatile private var sharp = 0f
+            @Volatile private var rotation = 0
+            @Volatile private var flipV = false
+            @Volatile private var flipH = false
+
+            private val texMatrix = FloatArray(16)
+            private val quadData = FloatArray(8)
+            private val quad: FloatBuffer = newFloatBuffer(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+            private val texCoords: FloatBuffer = newFloatBuffer(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+
+            private fun newFloatBuffer(vararg v: Float): FloatBuffer =
+                ByteBuffer.allocateDirect(v.size * 4).order(ByteOrder.nativeOrder())
+                    .asFloatBuffer().apply { put(v); position(0) }
+
+            fun setView(v: GLSurfaceView) { view = v }
+
+            fun setColors(b: Float, c: Float, s: Float, w: Float) {
+                brightness = b; contrast = c; saturation = s; warmth = w
+            }
+
+            /** 锐化强度 0..1 */
+            fun setSharpness(v: Float) { sharp = v }
+
+            /** 缓冲区内容相对于显示方向的旋转：Display.getRotation() 的值 0..3 */
+            fun setRotation(r: Int) { rotation = r and 3 }
+
+            fun setFlip(h: Boolean, v: Boolean) { flipH = h; flipV = v }
+
+            override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+                surfaceTexture?.release()
+                surface?.release()
+                surfaceTexture = null
+                surface = null
+
+                program = buildProgram(VERT, FRAG)
+                val ids = IntArray(1)
+                GLES20.glGenTextures(1, ids, 0)
+                texId = ids[0]
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+
+                val st = SurfaceTexture(texId)
+                st.setDefaultBufferSize(bufW, bufH)
+                st.setOnFrameAvailableListener(this)
+                surfaceTexture = st
+                val s = Surface(st)
+                surface = s
+                onSurfaceReady(s)
+            }
+
+            override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+                GLES20.glViewport(0, 0, width, height)
+            }
+
+            override fun onDrawFrame(gl: GL10?) {
+                val st = surfaceTexture ?: return
+                GLES20.glClearColor(0f, 0f, 0f, 1f)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                try { st.updateTexImage() } catch (_: Throwable) { return }
+                st.getTransformMatrix(texMatrix)
+
+                // 顶点顺序：左下、右下、左上、右上。翻转 = 交换顶点位置，画面内容不变
+                val x0 = if (flipH) 1f else -1f
+                val y0 = if (flipV) 1f else -1f
+                quadData[0] = x0;  quadData[1] = y0
+                quadData[2] = -x0; quadData[3] = y0
+                quadData[4] = x0;  quadData[5] = -y0
+                quadData[6] = -x0; quadData[7] = -y0
+                quad.position(0); quad.put(quadData); quad.position(0)
+                texCoords.position(0); texCoords.put(TEX[rotation and 3]); texCoords.position(0)
+
+                GLES20.glUseProgram(program)
+                GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program, "uTexMatrix"), 1, false, texMatrix, 0)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uBrightness"), brightness)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uContrast"), contrast)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uSaturation"), saturation)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uWarmth"), warmth)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uSharp"), sharp)
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(program, "uTexel"), 1f / bufW, 1f / bufH)
+
+                val aPos = GLES20.glGetAttribLocation(program, "aPos")
+                val aUV = GLES20.glGetAttribLocation(program, "aUV")
+                GLES20.glEnableVertexAttribArray(aPos)
+                GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+                GLES20.glEnableVertexAttribArray(aUV)
+                GLES20.glVertexAttribPointer(aUV, 2, GLES20.GL_FLOAT, false, 0, texCoords)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            }
+
+            override fun onFrameAvailable(st: SurfaceTexture) {
+                view?.requestRender()
+            }
+
+            private fun buildProgram(vs: String, fs: String): Int {
+                fun compile(type: Int, src: String): Int {
+                    val id = GLES20.glCreateShader(type)
+                    GLES20.glShaderSource(id, src)
+                    GLES20.glCompileShader(id)
+                    return id
+                }
+                val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+                val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
+                val p = GLES20.glCreateProgram()
+                GLES20.glAttachShader(p, v)
+                GLES20.glAttachShader(p, f)
+                GLES20.glLinkProgram(p)
+                return p
+            }
+
+            companion object {
+                /**
+                 * 四个顶点（左下、右下、左上、右上）对应的纹理坐标，按旋转 0/90/180/270 取。
+                 * 旋转 0 是标准 SurfaceTexture 写法（左下=(0,0)），系统给的 uTexMatrix 已含一次上下翻转，
+                 * 所以这里不能再预先翻转，否则画面会上下颠倒。
+                 */
+                private val TEX = arrayOf(
+                    floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f),
+                    floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f),
+                    floatArrayOf(1f, 1f, 0f, 1f, 1f, 0f, 0f, 0f),
+                    floatArrayOf(1f, 0f, 1f, 1f, 0f, 0f, 0f, 1f)
+                )
+
+                private const val VERT = """
+        attribute vec4 aPos;
+        attribute vec2 aUV;
+        uniform mat4 uTexMatrix;
+        varying vec2 vUV;
+        void main() { gl_Position = aPos; vUV = (uTexMatrix * vec4(aUV, 0.0, 1.0)).xy; }
+        """
+
+                private const val FRAG = """
+        #extension GL_OES_EGL_image_external : require
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        precision highp float;
+        #else
+        precision mediump float;
+        #endif
+        uniform samplerExternalOES sTex;
+        uniform float uBrightness;
+        uniform float uContrast;
+        uniform float uSaturation;
+        uniform float uWarmth;
+        uniform float uSharp;
+        uniform vec2 uTexel;
+        varying vec2 vUV;
+        void main() {
+            vec3 rgb = texture2D(sTex, vUV).rgb;
+            if (uSharp > 0.001) {
+                vec3 n = texture2D(sTex, vUV + vec2(uTexel.x, 0.0)).rgb
+                       + texture2D(sTex, vUV - vec2(uTexel.x, 0.0)).rgb
+                       + texture2D(sTex, vUV + vec2(0.0, uTexel.y)).rgb
+                       + texture2D(sTex, vUV - vec2(0.0, uTexel.y)).rgb;
+                rgb = rgb + (rgb * 4.0 - n) * uSharp * 0.6;
+            }
+            rgb = rgb + uBrightness;
+            rgb = (rgb - 0.5) * (1.0 + uContrast) + 0.5;
+            float g = dot(rgb, vec3(0.299, 0.587, 0.114));
+            rgb = mix(vec3(g), rgb, 1.0 + uSaturation);
+            rgb.r += uWarmth * 0.12;
+            rgb.b -= uWarmth * 0.12;
+            gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+        }
+        """
+            }
+        }
+        STRETCH_EOF
+        cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.app.AlertDialog
+        import android.content.Context
+        import android.graphics.Color
+        import android.graphics.Point
+        import android.hardware.display.DisplayManager
+        import android.opengl.GLSurfaceView
+        import android.os.Bundle
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.InputDevice
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+        import android.view.Surface
+        import android.view.View
+        import android.view.ViewGroup
+        import android.view.WindowInsets
+        import android.view.WindowManager
+        import android.widget.AdapterView
+        import android.widget.ArrayAdapter
+        import android.widget.FrameLayout
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.SeekBar
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import kotlin.concurrent.thread
+        import kotlin.math.roundToInt
+
+        /**
+         * 容器界面：
+         *  - GLSurfaceView 铺满全屏，用 OpenGL 把虚拟屏画面画出来（缓冲区比例 ≠ 屏幕比例 ⇒ 强制拉伸）
+         *  - GL 渲染支持明度/对比度/饱和度/色温和滤镜
+         *  - 触摸按 虚拟屏尺寸 / 控件尺寸 缩放后注入虚拟屏
+         */
+        class StretchActivity : Activity() {
+
+            companion object {
+                const val EXTRA_PKG = "pkg"
+                const val EXTRA_W = "w"
+                const val EXTRA_H = "h"
+                const val EXTRA_DPI = "dpi"
+                const val EXTRA_HZ = "hz"
+                const val EXTRA_FORCE_STOP = "force"
+                const val EXTRA_SHOW_MENU = "showMenu"
+                const val EXTRA_GYRO_FIX = "gyroFix"
+            }
+
+            private lateinit var glView: GLSurfaceView
+            private lateinit var renderer: StretchRenderer
+            private lateinit var pkg: String
+            private var vdW = 1920
+            private var vdH = 1080
+            private var dpi = 420
+            private var hz = 0
+            private var forceStop = true
+            private var showMenuBtn = true
+            private var gyroFix = false
+            private var flipV = false
+            private var flipH = false
+
+            /** 虚拟屏当前的逻辑尺寸（陀螺仪修复模式下以它为准） */
+            @Volatile private var logicalW = 0
+            @Volatile private var logicalH = 0
+            private var gyroLog = ""
+            private var dm: DisplayManager? = null
+            private val displayListener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(id: Int) {}
+                override fun onDisplayRemoved(id: Int) {}
+                override fun onDisplayChanged(id: Int) { if (id == displayId) syncDisplayState() }
+            }
+
+            @Volatile private var displayId = -1
+            private var launched = false
+            private var outputSurface: Surface? = null
+
+            /** 明度/对比度/饱和度/色温，范围 -1..1；第 5 项是锐化，范围 0..1 */
+            private val colorAdj = floatArrayOf(0f, 0f, 0f, 0f, 0f)
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                pkg = intent.getStringExtra(EXTRA_PKG) ?: run { finish(); return }
+                vdW = intent.getIntExtra(EXTRA_W, vdW)
+                vdH = intent.getIntExtra(EXTRA_H, vdH)
+                dpi = intent.getIntExtra(EXTRA_DPI, dpi)
+                hz = intent.getIntExtra(EXTRA_HZ, 0)
+                forceStop = intent.getBooleanExtra(EXTRA_FORCE_STOP, true)
+                showMenuBtn = intent.getBooleanExtra(EXTRA_SHOW_MENU, true)
+                gyroFix = intent.getBooleanExtra(EXTRA_GYRO_FIX, false)
+
+                for (i in 0..4) colorAdj[i] = prefs.getFloat("adj$i", 0f)
+                flipV = prefs.getBoolean("flipV", false)
+                flipH = prefs.getBoolean("flipH", false)
+
+                goImmersive()
+
+                renderer = StretchRenderer(if (gyroFix) vdH else vdW, if (gyroFix) vdW else vdH) { s -> onOutputSurfaceReady(s) }
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                renderer.setFlip(flipH, flipV)
+                glView = GLSurfaceView(this).apply {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                    setOnTouchListener { v, ev -> forwardTouch(v, ev); true }
+                }
+                renderer.setView(glView)
+
+                val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                root.addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                if (showMenuBtn) {
+                    val d = resources.displayMetrics.density
+                    val menu = TextView(this).apply {
+                        text = "⋮"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                        setBackgroundColor(0x55000000); alpha = 0.5f
+                        setOnClickListener { showMenu() }
+                    }
+                    root.addView(menu, FrameLayout.LayoutParams((40 * d).roundToInt(), (40 * d).roundToInt(),
+                        Gravity.TOP or Gravity.END).apply {
+                        topMargin = (8 * d).roundToInt(); rightMargin = (8 * d).roundToInt()
+                    })
+                }
+
+                setContentView(root)
+                ServiceClient.bind(this)
+            }
+
+            private fun goImmersive() {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    val cur = display?.mode
+                    val best = display?.supportedModes
+                        ?.filter { cur != null && it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                        ?.maxByOrNull { it.refreshRate }
+                    if (best != null) preferredDisplayModeId = best.modeId
+                }
+                window.setDecorFitsSystemWindows(false)
+                window.decorView.windowInsetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+            // ---------------- 虚拟屏生命周期 ----------------
+
+            private fun onOutputSurfaceReady(s: Surface) {
+                outputSurface = s
+                ServiceClient.whenReady { svc ->
+                    thread {
+                        try {
+                            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+                            val t0 = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - t0 < 3000 && (display?.refreshRate ?: 0f) < maxHz - 1f) {
+                                Thread.sleep(100)
+                            }
+                            // 陀螺仪修复模式：竖屏创建虚拟屏，让游戏按 90° 补偿传感器
+                            val dispW: Int
+                            val dispH: Int
+                            if (gyroFix) { dispW = vdH; dispH = vdW } else { dispW = vdW; dispH = vdH }
+                            val first = !launched
+                            svc.configure(gyroFix)
+                            displayId = svc.createDisplay(dispW, dispH, dpi, hz.toFloat(), s)
+                            if (gyroFix) {
+                                // 锁定为横屏方向(1)，在启动游戏之前设置，避免游戏启动后再转屏
+                                val rr = svc.setDisplayRotation(displayId, 1)
+                                if (first) gyroLog = rr
+                                runOnUiThread { startDisplayWatch() }
+                            }
+                            if (!launched) {
+                                launched = true
+                                val out = svc.launch(pkg, displayId, forceStop)
+                                if (out.contains("Error", true) || out.startsWith("ERR") || out.startsWith("找不到"))
+                                    runOnUiThread { Toast.makeText(this, out, Toast.LENGTH_LONG).show() }
+                            }
+                            if (gyroFix && first) {
+                                Thread.sleep(2500)
+                                runOnUiThread { showGyroDiag() }
+                            }
+                        } catch (t: Throwable) {
+                            runOnUiThread { Toast.makeText(this, "创建虚拟屏失败: ${t.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+            }
+
+            override fun onResume() {
+                super.onResume()
+                glView.onResume()   // GL 重建后会再给一个新 Surface，自动重新 attach
+            }
+
+            override fun onPause() {
+                // 退到后台：只暂停输出，虚拟屏和游戏继续存活
+                thread { try { ServiceClient.service?.setSurface(null) } catch (_: Throwable) {} }
+                glView.onPause()
+                super.onPause()
+            }
+
+            // ---------------- 触摸转发 ----------------
+
+            private fun forwardTouch(v: View, ev: MotionEvent) {
+                val svc = ServiceClient.service ?: return
+                val id = displayId
+                if (id < 0 || v.width == 0 || v.height == 0) return
+
+                val lw = if (gyroFix && logicalW > 0) logicalW else vdW
+                val lh = if (gyroFix && logicalH > 0) logicalH else vdH
+                val sx = lw.toFloat() / v.width
+                val sy = lh.toFloat() / v.height
+                val n = ev.pointerCount
+                val props = Array(n) { i -> MotionEvent.PointerProperties().also { ev.getPointerProperties(i, it) } }
+                val coords = Array(n) { i ->
+                    MotionEvent.PointerCoords().also {
+                        ev.getPointerCoords(i, it)
+                        it.x = (if (flipH) v.width - it.x else it.x) * sx
+                        it.y = (if (flipV) v.height - it.y else it.y) * sy
+                    }
+                }
+                val out = MotionEvent.obtain(
+                    ev.downTime, ev.eventTime, ev.action, n, props, coords,
+                    ev.metaState, ev.buttonState, 1f, 1f, ev.deviceId, ev.edgeFlags,
+                    InputDevice.SOURCE_TOUCHSCREEN, ev.flags
+                )
+                try { svc.injectTouch(id, out) } catch (_: Throwable) {} finally { out.recycle() }
+            }
+
+            // ---------------- 菜单 / 画面调节 ----------------
+
+            private fun showMenu() {
+                val items = arrayOf(
+                    "画面调节（明度/对比度/滤镜/锐化）",
+                    "上下翻转画面：" + (if (flipV) "开" else "关"),
+                    "左右翻转画面：" + (if (flipH) "开" else "关"),
+                    "发送返回键", "停止并退出", "取消"
+                )
+                AlertDialog.Builder(this)
+                    .setItems(items) { _, which ->
+                        when (which) {
+                            0 -> showColorDialog()
+                            1 -> { flipV = !flipV; applyFlip() }
+                            2 -> { flipH = !flipH; applyFlip() }
+                            3 -> sendKey(KeyEvent.KEYCODE_BACK)
+                            4 -> stopAndExit()
+                        }
+                    }.show()
+            }
+
+            private fun applyFlip() {
+                renderer.setFlip(flipH, flipV)
+                glView.requestRender()
+                prefs.edit().putBoolean("flipV", flipV).putBoolean("flipH", flipH).apply()
+            }
+
+            // ---------------- 陀螺仪修复：跟踪虚拟屏旋转 ----------------
+
+            private fun startDisplayWatch() {
+                if (dm == null) {
+                    dm = getSystemService(DisplayManager::class.java)
+                    dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+                }
+                syncDisplayState()
+            }
+
+            @Suppress("DEPRECATION")
+            private fun syncDisplayState() {
+                val d = dm?.getDisplay(displayId) ?: return
+                val p = Point()
+                d.getRealSize(p)
+                logicalW = p.x
+                logicalH = p.y
+                if (gyroFix) {
+                    renderer.setRotation(d.rotation)
+                    glView.requestRender()
+                }
+            }
+
+            private fun showGyroDiag() {
+                syncDisplayState()
+                val d = dm?.getDisplay(displayId)
+                val msg = "虚拟屏旋转 = ${d?.rotation}（1 或 3 才是横屏）\n" +
+                    "逻辑尺寸 = ${logicalW}x${logicalH}\n" +
+                    "锁定旋转命令输出：${if (gyroLog.isEmpty()) "（无输出=成功）" else gyroLog}"
+                AlertDialog.Builder(this).setTitle("陀螺仪修复诊断").setMessage(msg)
+                    .setPositiveButton("确定", null).show()
+            }
+
+            private fun showColorDialog() {
+                val names = arrayOf("明度", "对比度", "饱和度", "色温")
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(40, 20, 40, 0)
+                }
+                val seeks = Array(4) { i ->
+                    SeekBar(this).apply {
+                        max = 200
+                        progress = ((colorAdj[i] + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                                colorAdj[i] = p / 100f - 1f
+                                applyColors()
+                            }
+                            override fun onStartTrackingTouch(sb: SeekBar?) {}
+                            override fun onStopTrackingTouch(sb: SeekBar?) {}
+                        })
+                    }
+                }
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = names[i] })
+                    root.addView(seeks[i])
+                }
+
+                root.addView(TextView(this).apply { text = "锐化（画面发糊时往右拉）" })
+                root.addView(SeekBar(this).apply {
+                    max = 100
+                    progress = (colorAdj[4] * 100).roundToInt()
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                            colorAdj[4] = p / 100f
+                            applyColors()
+                        }
+                        override fun onStartTrackingTouch(sb: SeekBar?) {}
+                        override fun onStopTrackingTouch(sb: SeekBar?) {}
+                    })
+                })
+
+                val filters = listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳")
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
+                var initial = true   // Spinner 刚显示时会自动回调一次，必须跳过，否则会把已保存的调节清零
+                sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        if (initial) { initial = false; return }
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) {
+                            colorAdj[i] = preset[i]
+                            seeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                        }
+                        applyColors()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(TextView(this).apply { text = "滤镜" })
+                root.addView(sp)
+
+                AlertDialog.Builder(this)
+                    .setTitle("画面调节")
+                    .setView(ScrollView(this).apply { addView(root) })
+                    .setPositiveButton("完成") { _, _ -> saveColors() }
+                    .show()
+            }
+
+            private fun applyColors() {
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                glView.requestRender()
+            }
+
+            private fun saveColors() {
+                val e = prefs.edit()
+                for (i in 0..4) e.putFloat("adj$i", colorAdj[i])
+                e.apply()
+            }
+            // ---------------- 按键 / 退出 ----------------
+
+            private fun sendKey(code: Int) {
+                val id = displayId; val s = ServiceClient.service ?: return
+                if (id >= 0) thread { try { s.injectKey(id, code) } catch (_: Throwable) {} }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onBackPressed() = sendKey(KeyEvent.KEYCODE_BACK)
+
+            private fun stopAndExit() {
+                val s = ServiceClient.service
+                thread {
+                    try { s?.releaseDisplay() } catch (_: Throwable) {}
+                    runOnUiThread { finish() }
+                }
+            }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                try { dm?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
+                if (isFinishing) {
+                    val s = ServiceClient.service
+                    thread { try { s?.releaseDisplay() } catch (_: Throwable) {} }
+                }
+            }
+        }
+        STRETCH_EOF
+                cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.app.AlertDialog
+        import android.content.Context
+        import android.graphics.Color
+        import android.graphics.Point
+        import android.hardware.display.DisplayManager
+        import android.opengl.GLSurfaceView
+        import android.os.Bundle
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.InputDevice
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+        import android.view.Surface
+        import android.view.View
+        import android.view.ViewGroup
+        import android.view.WindowInsets
+        import android.view.WindowManager
+        import android.widget.AdapterView
+        import android.widget.ArrayAdapter
+        import android.widget.FrameLayout
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.SeekBar
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import kotlin.concurrent.thread
+        import kotlin.math.roundToInt
+
+        /**
+         * 容器界面：
+         *  - GLSurfaceView 铺满全屏，用 OpenGL 把虚拟屏画面画出来（缓冲区比例 ≠ 屏幕比例 ⇒ 强制拉伸）
+         *  - GL 渲染支持明度/对比度/饱和度/色温和滤镜
+         *  - 触摸按 虚拟屏尺寸 / 控件尺寸 缩放后注入虚拟屏
+         */
+        class StretchActivity : Activity() {
+
+            companion object {
+                const val EXTRA_PKG = "pkg"
+                const val EXTRA_W = "w"
+                const val EXTRA_H = "h"
+                const val EXTRA_DPI = "dpi"
+                const val EXTRA_HZ = "hz"
+                const val EXTRA_FORCE_STOP = "force"
+                const val EXTRA_SHOW_MENU = "showMenu"
+                const val EXTRA_GYRO_FIX = "gyroFix"
+            }
+
+            private lateinit var glView: GLSurfaceView
+            private lateinit var renderer: StretchRenderer
+            private lateinit var pkg: String
+            private var vdW = 1920
+            private var vdH = 1080
+            private var dpi = 420
+            private var hz = 0
+            private var forceStop = true
+            private var showMenuBtn = true
+            private var gyroFix = false
+            private var flipV = false
+            private var flipH = false
+
+            /** 虚拟屏当前的逻辑尺寸（陀螺仪修复模式下以它为准） */
+            @Volatile private var logicalW = 0
+            @Volatile private var logicalH = 0
+            private var gyroLog = ""
+            private var gyroInvert = false
+            private var lastVdRot = -1
+            private var dm: DisplayManager? = null
+            private val displayListener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(id: Int) {}
+                override fun onDisplayRemoved(id: Int) {}
+                override fun onDisplayChanged(id: Int) {
+                    if (id == displayId) syncDisplayState()
+                    else if (gyroFix && id == (display?.displayId ?: -1)) applyVdRotation()   // 真屏转向时，虚拟屏跟着转
+                }
+            }
+
+            @Volatile private var displayId = -1
+            private var launched = false
+            private var outputSurface: Surface? = null
+
+            /** 明度/对比度/饱和度/色温，范围 -1..1；第 5 项是锐化，范围 0..1 */
+            private val colorAdj = floatArrayOf(0f, 0f, 0f, 0f, 0f)
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                pkg = intent.getStringExtra(EXTRA_PKG) ?: run { finish(); return }
+                vdW = intent.getIntExtra(EXTRA_W, vdW)
+                vdH = intent.getIntExtra(EXTRA_H, vdH)
+                dpi = intent.getIntExtra(EXTRA_DPI, dpi)
+                hz = intent.getIntExtra(EXTRA_HZ, 0)
+                forceStop = intent.getBooleanExtra(EXTRA_FORCE_STOP, true)
+                showMenuBtn = intent.getBooleanExtra(EXTRA_SHOW_MENU, true)
+                gyroFix = intent.getBooleanExtra(EXTRA_GYRO_FIX, false)
+
+                for (i in 0..4) colorAdj[i] = prefs.getFloat("adj$i", 0f)
+                flipV = prefs.getBoolean("flipV", false)
+                flipH = prefs.getBoolean("flipH", false)
+                gyroInvert = prefs.getBoolean("gyroInvert", false)
+
+                goImmersive()
+
+                renderer = StretchRenderer(if (gyroFix) vdH else vdW, if (gyroFix) vdW else vdH) { s -> onOutputSurfaceReady(s) }
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                renderer.setFlip(flipH, flipV)
+                glView = GLSurfaceView(this).apply {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                    setOnTouchListener { v, ev -> forwardTouch(v, ev); true }
+                }
+                renderer.setView(glView)
+
+                val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                root.addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                if (showMenuBtn) {
+                    val d = resources.displayMetrics.density
+                    val menu = TextView(this).apply {
+                        text = "⋮"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                        setBackgroundColor(0x55000000); alpha = 0.5f
+                        setOnClickListener { showMenu() }
+                    }
+                    root.addView(menu, FrameLayout.LayoutParams((40 * d).roundToInt(), (40 * d).roundToInt(),
+                        Gravity.TOP or Gravity.END).apply {
+                        topMargin = (8 * d).roundToInt(); rightMargin = (8 * d).roundToInt()
+                    })
+                }
+
+                setContentView(root)
+                ServiceClient.bind(this)
+            }
+
+            private fun goImmersive() {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    val cur = display?.mode
+                    val best = display?.supportedModes
+                        ?.filter { cur != null && it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                        ?.maxByOrNull { it.refreshRate }
+                    if (best != null) preferredDisplayModeId = best.modeId
+                }
+                window.setDecorFitsSystemWindows(false)
+                window.decorView.windowInsetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+
+            // ---------------- 虚拟屏生命周期 ----------------
+
+            private fun onOutputSurfaceReady(s: Surface) {
+                outputSurface = s
+                ServiceClient.whenReady { svc ->
+                    thread {
+                        try {
+                            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+                            val t0 = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - t0 < 3000 && (display?.refreshRate ?: 0f) < maxHz - 1f) {
+                                Thread.sleep(100)
+                            }
+                            // 陀螺仪修复模式：竖屏创建虚拟屏，让游戏按 90° 补偿传感器
+                            val dispW: Int
+                            val dispH: Int
+                            if (gyroFix) { dispW = vdH; dispH = vdW } else { dispW = vdW; dispH = vdH }
+                            val first = !launched
+                            svc.configure(gyroFix)
+                            displayId = svc.createDisplay(dispW, dispH, dpi, hz.toFloat(), s)
+                            if (gyroFix) {
+                                // 虚拟屏旋转方向 = 真屏当前的横屏方向(1或3)，在启动游戏之前设置
+                                val rot = desiredVdRotation()
+                                lastVdRot = rot
+                                val rr = svc.setDisplayRotation(displayId, rot)
+                                if (first) gyroLog = rr
+                                runOnUiThread { startDisplayWatch() }
+                            }
+                            if (!launched) {
+                                launched = true
+                                val out = svc.launch(pkg, displayId, forceStop)
+                                if (out.contains("Error", true) || out.startsWith("ERR") || out.startsWith("找不到"))
+                                    runOnUiThread { Toast.makeText(this, out, Toast.LENGTH_LONG).show() }
+                            }
+                            if (gyroFix && first) {
+                                Thread.sleep(2500)
+                                runOnUiThread { showGyroDiag() }
+                            }
+                        } catch (t: Throwable) {
+                            runOnUiThread { Toast.makeText(this, "创建虚拟屏失败: ${t.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+            }
+
+            override fun onResume() {
+                super.onResume()
+                glView.onResume()   // GL 重建后会再给一个新 Surface，自动重新 attach
+            }
+
+            override fun onPause() {
+                // 退到后台：只暂停输出，虚拟屏和游戏继续存活
+                thread { try { ServiceClient.service?.setSurface(null) } catch (_: Throwable) {} }
+                glView.onPause()
+                super.onPause()
+            }
+
+            // ---------------- 触摸转发 ----------------
+
+            private fun forwardTouch(v: View, ev: MotionEvent) {
+                val svc = ServiceClient.service ?: return
+                val id = displayId
+                if (id < 0 || v.width == 0 || v.height == 0) return
+
+                val lw = if (gyroFix && logicalW > 0) logicalW else vdW
+                val lh = if (gyroFix && logicalH > 0) logicalH else vdH
+                val sx = lw.toFloat() / v.width
+                val sy = lh.toFloat() / v.height
+                val n = ev.pointerCount
+                val props = Array(n) { i -> MotionEvent.PointerProperties().also { ev.getPointerProperties(i, it) } }
+                val coords = Array(n) { i ->
+                    MotionEvent.PointerCoords().also {
+                        ev.getPointerCoords(i, it)
+                        it.x = (if (flipH) v.width - it.x else it.x) * sx
+                        it.y = (if (flipV) v.height - it.y else it.y) * sy
+                    }
+                }
+                val out = MotionEvent.obtain(
+                    ev.downTime, ev.eventTime, ev.action, n, props, coords,
+                    ev.metaState, ev.buttonState, 1f, 1f, ev.deviceId, ev.edgeFlags,
+                    InputDevice.SOURCE_TOUCHSCREEN, ev.flags
+                )
+                try { svc.injectTouch(id, out) } catch (_: Throwable) {} finally { out.recycle() }
+            }
+
+            // ---------------- 菜单 / 画面调节 ----------------
+
+            private fun showMenu() {
+                val labels = ArrayList<String>()
+                val actions = ArrayList<() -> Unit>()
+                fun add(label: String, action: () -> Unit) { labels.add(label); actions.add(action) }
+                add("画面调节（明度/对比度/滤镜/锐化）") { showColorDialog() }
+                add("上下翻转画面：" + (if (flipV) "开" else "关")) { flipV = !flipV; applyFlip() }
+                add("左右翻转画面：" + (if (flipH) "开" else "关")) { flipH = !flipH; applyFlip() }
+                if (gyroFix) {
+                    add("陀螺仪方向反转：" + (if (gyroInvert) "开" else "关") + "（视角方向反了就点这里）") {
+                        gyroInvert = !gyroInvert
+                        prefs.edit().putBoolean("gyroInvert", gyroInvert).apply()
+                        applyVdRotation()
+                    }
+                }
+                add("发送返回键") { sendKey(KeyEvent.KEYCODE_BACK) }
+                add("停止并退出") { stopAndExit() }
+                AlertDialog.Builder(this)
+                    .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+                    .show()
+            }
+
+            private fun applyFlip() {
+                renderer.setFlip(flipH, flipV)
+                glView.requestRender()
+                prefs.edit().putBoolean("flipV", flipV).putBoolean("flipH", flipH).apply()
+            }
+
+            // ---------------- 陀螺仪修复：跟踪虚拟屏旋转 ----------------
+
+            private fun startDisplayWatch() {
+                if (dm == null) {
+                    dm = getSystemService(DisplayManager::class.java)
+                    dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+                }
+                syncDisplayState()
+            }
+
+            @Suppress("DEPRECATION")
+            private fun syncDisplayState() {
+                val d = dm?.getDisplay(displayId) ?: return
+                val p = Point()
+                d.getRealSize(p)
+                logicalW = p.x
+                logicalH = p.y
+                if (gyroFix) {
+                    renderer.setRotation(d.rotation)
+                    glView.requestRender()
+                }
+            }
+
+            /** 虚拟屏应锁定的旋转方向：跟随真屏的横屏方向(1或3)，可手动反转 */
+            private fun desiredVdRotation(): Int {
+                val r = display?.rotation ?: 1
+                val base = if (r == 1 || r == 3) r else 1
+                return if (gyroInvert) 4 - base else base
+            }
+
+            private fun applyVdRotation() {
+                val id = displayId
+                val s = ServiceClient.service ?: return
+                if (id < 0 || !gyroFix) return
+                val rot = desiredVdRotation()
+                if (rot == lastVdRot) return
+                lastVdRot = rot
+                thread { try { s.setDisplayRotation(id, rot) } catch (_: Throwable) {} }
+            }
+
+            private fun showGyroDiag() {
+                syncDisplayState()
+                val d = dm?.getDisplay(displayId)
+                val msg = "真屏旋转 = ${display?.rotation}\n" +
+                    "虚拟屏旋转 = ${d?.rotation}（应为 1 或 3，且与真屏一致）\n" +
+                    "逻辑尺寸 = ${logicalW}x${logicalH}\n" +
+                    "锁定旋转命令输出：${if (gyroLog.isEmpty()) "（无输出=成功）" else gyroLog}"
+                AlertDialog.Builder(this).setTitle("陀螺仪修复诊断").setMessage(msg)
+                    .setPositiveButton("确定", null).show()
+            }
+
+            private fun showColorDialog() {
+                val names = arrayOf("明度", "对比度", "饱和度", "色温")
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(40, 20, 40, 0)
+                }
+                val seeks = Array(4) { i ->
+                    SeekBar(this).apply {
+                        max = 200
+                        progress = ((colorAdj[i] + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                                colorAdj[i] = p / 100f - 1f
+                                applyColors()
+                            }
+                            override fun onStartTrackingTouch(sb: SeekBar?) {}
+                            override fun onStopTrackingTouch(sb: SeekBar?) {}
+                        })
+                    }
+                }
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = names[i] })
+                    root.addView(seeks[i])
+                }
+
+                root.addView(TextView(this).apply { text = "锐化（画面发糊时往右拉）" })
+                root.addView(SeekBar(this).apply {
+                    max = 100
+                    progress = (colorAdj[4] * 100).roundToInt()
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                            colorAdj[4] = p / 100f
+                            applyColors()
+                        }
+                        override fun onStartTrackingTouch(sb: SeekBar?) {}
+                        override fun onStopTrackingTouch(sb: SeekBar?) {}
+                    })
+                })
+
+                val filters = listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳")
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
+                var initial = true   // Spinner 刚显示时会自动回调一次，必须跳过，否则会把已保存的调节清零
+                sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        if (initial) { initial = false; return }
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) {
+                            colorAdj[i] = preset[i]
+                            seeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                        }
+                        applyColors()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(TextView(this).apply { text = "滤镜" })
+                root.addView(sp)
+
+                AlertDialog.Builder(this)
+                    .setTitle("画面调节")
+                    .setView(ScrollView(this).apply { addView(root) })
+                    .setPositiveButton("完成") { _, _ -> saveColors() }
+                    .show()
+            }
+
+            private fun applyColors() {
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                glView.requestRender()
+            }
+
+            private fun saveColors() {
+                val e = prefs.edit()
+                for (i in 0..4) e.putFloat("adj$i", colorAdj[i])
+                e.apply()
+            }
+
+            // ---------------- 按键 / 退出 ----------------
+
+            private fun sendKey(code: Int) {
+                val id = displayId; val s = ServiceClient.service ?: return
+                if (id >= 0) thread { try { s.injectKey(id, code) } catch (_: Throwable) {} }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onBackPressed() = sendKey(KeyEvent.KEYCODE_BACK)
+
+            private fun stopAndExit() {
+                val s = ServiceClient.service
+                thread {
+                    try { s?.releaseDisplay() } catch (_: Throwable) {}
+                    runOnUiThread { finish() }
+                }
+            }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                try { dm?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
+                if (isFinishing) {
+                    val s = ServiceClient.service
+                    thread { try { s?.releaseDisplay() } catch (_: Throwable) {} }
+                }
+            }
+               
+        }
+        STRETCH_EOF
+                cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.app.AlertDialog
+        import android.content.Context
+        import android.graphics.Color
+        import android.graphics.Point
+        import android.hardware.display.DisplayManager
+        import android.opengl.GLSurfaceView
+        import android.os.Bundle
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.InputDevice
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+        import android.view.Surface
+        import android.view.View
+        import android.view.ViewGroup
+        import android.view.WindowInsets
+        import android.view.WindowManager
+        import android.widget.AdapterView
+        import android.widget.ArrayAdapter
+        import android.widget.FrameLayout
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.SeekBar
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import kotlin.concurrent.thread
+        import kotlin.math.roundToInt
+
+        /**
+         * 容器界面：
+         *  - GLSurfaceView 铺满全屏，用 OpenGL 把虚拟屏画面画出来（缓冲区比例 ≠ 屏幕比例 ⇒ 强制拉伸）
+         *  - GL 渲染支持明度/对比度/饱和度/色温和滤镜
+         *  - 触摸按 虚拟屏尺寸 / 控件尺寸 缩放后注入虚拟屏
+         */
+        class StretchActivity : Activity() {
+
+            companion object {
+                const val EXTRA_PKG = "pkg"
+                const val EXTRA_W = "w"
+                const val EXTRA_H = "h"
+                const val EXTRA_DPI = "dpi"
+                const val EXTRA_HZ = "hz"
+                const val EXTRA_FORCE_STOP = "force"
+                const val EXTRA_SHOW_MENU = "showMenu"
+                const val EXTRA_GYRO_FIX = "gyroFix"
+            }
+
+            private lateinit var glView: GLSurfaceView
+            private lateinit var renderer: StretchRenderer
+            private lateinit var pkg: String
+            private var vdW = 1920
+            private var vdH = 1080
+            private var dpi = 420
+            private var hz = 0
+            private var forceStop = true
+            private var showMenuBtn = true
+            private var gyroFix = false
+            private var flipV = false
+            private var flipH = false
+
+            /** 虚拟屏当前的逻辑尺寸（陀螺仪修复模式下以它为准） */
+            @Volatile private var logicalW = 0
+            @Volatile private var logicalH = 0
+            private var gyroLog = ""
+            private var gyroInvert = false
+            private var lastVdRot = -1
+            private var dm: DisplayManager? = null
+            private val displayListener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(id: Int) {}
+                override fun onDisplayRemoved(id: Int) {}
+                override fun onDisplayChanged(id: Int) {
+                    if (id == displayId) syncDisplayState()
+                    else if (gyroFix && id == (display?.displayId ?: -1)) applyVdRotation()   // 真屏转向时，虚拟屏跟着转
+                }
+            }
+
+            @Volatile private var displayId = -1
+            private var launched = false
+            private var outputSurface: Surface? = null
+
+            /** 明度/对比度/饱和度/色温，范围 -1..1；第 5 项是锐化，范围 0..1 */
+            private val colorAdj = floatArrayOf(0f, 0f, 0f, 0f, 0f)
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                pkg = intent.getStringExtra(EXTRA_PKG) ?: run { finish(); return }
+                vdW = intent.getIntExtra(EXTRA_W, vdW)
+                vdH = intent.getIntExtra(EXTRA_H, vdH)
+                dpi = intent.getIntExtra(EXTRA_DPI, dpi)
+                hz = intent.getIntExtra(EXTRA_HZ, 0)
+                forceStop = intent.getBooleanExtra(EXTRA_FORCE_STOP, true)
+                showMenuBtn = intent.getBooleanExtra(EXTRA_SHOW_MENU, true)
+                gyroFix = intent.getBooleanExtra(EXTRA_GYRO_FIX, false)
+
+                for (i in 0..4) colorAdj[i] = prefs.getFloat("adj$i", 0f)
+                flipV = prefs.getBoolean("flipV", false)
+                flipH = prefs.getBoolean("flipH", false)
+                gyroInvert = prefs.getBoolean("gyroInvert", false)
+
+                goImmersive()
+
+                renderer = StretchRenderer(if (gyroFix) vdH else vdW, if (gyroFix) vdW else vdH) { s -> onOutputSurfaceReady(s) }
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                renderer.setFlip(flipH, flipV)
+                glView = GLSurfaceView(this).apply {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                    setOnTouchListener { v, ev -> forwardTouch(v, ev); true }
+                }
+                renderer.setView(glView)
+
+                val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                root.addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                if (showMenuBtn) {
+                    val d = resources.displayMetrics.density
+                    val menu = TextView(this).apply {
+                        text = "⋮"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                        setBackgroundColor(0x55000000); alpha = 0.5f
+                        setOnClickListener { showMenu() }
+                    }
+                    root.addView(menu, FrameLayout.LayoutParams((40 * d).roundToInt(), (40 * d).roundToInt(),
+                        Gravity.TOP or Gravity.END).apply {
+                        topMargin = (8 * d).roundToInt(); rightMargin = (8 * d).roundToInt()
+                    })
+                }
+
+                setContentView(root)
+                ServiceClient.bind(this)
+            }
+
+            private fun goImmersive() {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    val cur = display?.mode
+                    val best = display?.supportedModes
+                        ?.filter { cur != null && it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                        ?.maxByOrNull { it.refreshRate }
+                    if (best != null) preferredDisplayModeId = best.modeId
+                }
+                window.setDecorFitsSystemWindows(false)
+                window.decorView.windowInsetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+
+            // ---------------- 虚拟屏生命周期 ----------------
+
+            private fun onOutputSurfaceReady(s: Surface) {
+                outputSurface = s
+                ServiceClient.whenReady { svc ->
+                    thread {
+                        try {
+                            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+                            val t0 = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - t0 < 3000 && (display?.refreshRate ?: 0f) < maxHz - 1f) {
+                                Thread.sleep(100)
+                            }
+                            // 陀螺仪修复模式：竖屏创建虚拟屏，让游戏按 90° 补偿传感器
+                            val dispW: Int
+                            val dispH: Int
+                            if (gyroFix) { dispW = vdH; dispH = vdW } else { dispW = vdW; dispH = vdH }
+                            val first = !launched
+                            svc.configure(gyroFix)
+                            displayId = svc.createDisplay(dispW, dispH, dpi, hz.toFloat(), s)
+                            if (gyroFix) {
+                                // 虚拟屏旋转方向 = 真屏当前的横屏方向(1或3)，在启动游戏之前设置
+                                val rot = desiredVdRotation()
+                                lastVdRot = rot
+                                val rr = svc.setDisplayRotation(displayId, rot)
+                                if (first) gyroLog = rr
+                                runOnUiThread { startDisplayWatch() }
+                            }
+                            if (!launched) {
+                                launched = true
+                                val out = svc.launch(pkg, displayId, forceStop)
+                                if (out.contains("Error", true) || out.startsWith("ERR") || out.startsWith("找不到"))
+                                    runOnUiThread { Toast.makeText(this, out, Toast.LENGTH_LONG).show() }
+                            }
+                            if (gyroFix && first) {
+                                Thread.sleep(2500)
+                                runOnUiThread { showGyroDiag() }
+                            }
+                        } catch (t: Throwable) {
+                            runOnUiThread { Toast.makeText(this, "创建虚拟屏失败: ${t.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+            }
+
+            override fun onResume() {
+                super.onResume()
+                glView.onResume()   // GL 重建后会再给一个新 Surface，自动重新 attach
+            }
+
+            override fun onPause() {
+                // 退到后台：只暂停输出，虚拟屏和游戏继续存活
+                thread { try { ServiceClient.service?.setSurface(null) } catch (_: Throwable) {} }
+                glView.onPause()
+                super.onPause()
+            }
+
+            // ---------------- 触摸转发 ----------------
+
+            private fun forwardTouch(v: View, ev: MotionEvent) {
+                val svc = ServiceClient.service ?: return
+                val id = displayId
+                if (id < 0 || v.width == 0 || v.height == 0) return
+
+                val lw = if (gyroFix && logicalW > 0) logicalW else vdW
+                val lh = if (gyroFix && logicalH > 0) logicalH else vdH
+                val sx = lw.toFloat() / v.width
+                val sy = lh.toFloat() / v.height
+                val n = ev.pointerCount
+                val props = Array(n) { i -> MotionEvent.PointerProperties().also { ev.getPointerProperties(i, it) } }
+                val coords = Array(n) { i ->
+                    MotionEvent.PointerCoords().also {
+                        ev.getPointerCoords(i, it)
+                        it.x = (if (flipH) v.width - it.x else it.x) * sx
+                        it.y = (if (flipV) v.height - it.y else it.y) * sy
+                    }
+                }
+                val out = MotionEvent.obtain(
+                    ev.downTime, ev.eventTime, ev.action, n, props, coords,
+                    ev.metaState, ev.buttonState, 1f, 1f, ev.deviceId, ev.edgeFlags,
+                    InputDevice.SOURCE_TOUCHSCREEN, ev.flags
+                )
+                try { svc.injectTouch(id, out) } catch (_: Throwable) {} finally { out.recycle() }
+            }
+
+            // ---------------- 菜单 / 画面调节 ----------------
+
+            private fun showMenu() {
+                val labels = ArrayList<String>()
+                val actions = ArrayList<() -> Unit>()
+                fun add(label: String, action: () -> Unit) { labels.add(label); actions.add(action) }
+                add("画面调节（明度/对比度/滤镜/锐化）") { showColorDialog() }
+                add("上下翻转画面：" + (if (flipV) "开" else "关")) { flipV = !flipV; applyFlip() }
+                add("左右翻转画面：" + (if (flipH) "开" else "关")) { flipH = !flipH; applyFlip() }
+                if (gyroFix) {
+                    add("陀螺仪方向反转：" + (if (gyroInvert) "开" else "关") + "（视角方向反了就点这里）") {
+                        gyroInvert = !gyroInvert
+                        prefs.edit().putBoolean("gyroInvert", gyroInvert).apply()
+                        applyVdRotation()
+                    }
+                }
+                add("发送返回键") { sendKey(KeyEvent.KEYCODE_BACK) }
+                add("停止并退出") { stopAndExit() }
+                AlertDialog.Builder(this)
+                    .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+                    .show()
+            }
+
+            private fun applyFlip() {
+                renderer.setFlip(flipH, flipV)
+                glView.requestRender()
+                prefs.edit().putBoolean("flipV", flipV).putBoolean("flipH", flipH).apply()
+            }
+
+            // ---------------- 陀螺仪修复：跟踪虚拟屏旋转 ----------------
+
+            private fun startDisplayWatch() {
+                if (dm == null) {
+                    dm = getSystemService(DisplayManager::class.java)
+                    dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+                }
+                syncDisplayState()
+            }
+
+            @Suppress("DEPRECATION")
+            private fun syncDisplayState() {
+                val d = dm?.getDisplay(displayId) ?: return
+                val p = Point()
+                d.getRealSize(p)
+                logicalW = p.x
+                logicalH = p.y
+                if (gyroFix) {
+                    renderer.setRotation(d.rotation)
+                    glView.requestRender()
+                }
+            }
+
+            /** 虚拟屏应锁定的旋转方向：跟随真屏的横屏方向(1或3)，可手动反转 */
+            private fun desiredVdRotation(): Int {
+                val r = display?.rotation ?: 1
+                val base = if (r == 1 || r == 3) r else 1
+                return if (gyroInvert) 4 - base else base
+            }
+
+            private fun applyVdRotation() {
+                val id = displayId
+                val s = ServiceClient.service ?: return
+                if (id < 0 || !gyroFix) return
+                val rot = desiredVdRotation()
+                if (rot == lastVdRot) return
+                lastVdRot = rot
+                thread { try { s.setDisplayRotation(id, rot) } catch (_: Throwable) {} }
+            }
+
+            private fun showGyroDiag() {
+                syncDisplayState()
+                val d = dm?.getDisplay(displayId)
+                val msg = "真屏旋转 = ${display?.rotation}\n" +
+                    "虚拟屏旋转 = ${d?.rotation}（应为 1 或 3，且与真屏一致）\n" +
+                    "逻辑尺寸 = ${logicalW}x${logicalH}\n" +
+                    "锁定旋转命令输出：${if (gyroLog.isEmpty()) "（无输出=成功）" else gyroLog}"
+                AlertDialog.Builder(this).setTitle("陀螺仪修复诊断").setMessage(msg)
+                    .setPositiveButton("确定", null).show()
+            }
+
+            private fun showColorDialog() {
+                val names = arrayOf("明度", "对比度", "饱和度", "色温")
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(40, 20, 40, 0)
+                }
+                val seeks = Array(4) { i ->
+                    SeekBar(this).apply {
+                        max = 200
+                        progress = ((colorAdj[i] + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                                colorAdj[i] = p / 100f - 1f
+                                applyColors()
+                            }
+                            override fun onStartTrackingTouch(sb: SeekBar?) {}
+                            override fun onStopTrackingTouch(sb: SeekBar?) {}
+                        })
+                    }
+                }
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = names[i] })
+                    root.addView(seeks[i])
+                }
+
+                root.addView(TextView(this).apply { text = "锐化（画面发糊时往右拉）" })
+                root.addView(SeekBar(this).apply {
+                    max = 100
+                    progress = (colorAdj[4] * 100).roundToInt()
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                            colorAdj[4] = p / 100f
+                            applyColors()
+                        }
+                        override fun onStartTrackingTouch(sb: SeekBar?) {}
+                        override fun onStopTrackingTouch(sb: SeekBar?) {}
+                    })
+                })
+
+                val filters = listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳")
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
+                var initial = true   // Spinner 刚显示时会自动回调一次，必须跳过，否则会把已保存的调节清零
+                sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        if (initial) { initial = false; return }
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) {
+                            colorAdj[i] = preset[i]
+                            seeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                        }
+                        applyColors()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(TextView(this).apply { text = "滤镜" })
+                root.addView(sp)
+
+                AlertDialog.Builder(this)
+                    .setTitle("画面调节")
+                    .setView(ScrollView(this).apply { addView(root) })
+                    .setPositiveButton("完成") { _, _ -> saveColors() }
+                    .show()
+            }
+
+            private fun applyColors() {
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                glView.requestRender()
+            }
+
+            private fun saveColors() {
+                val e = prefs.edit()
+                for (i in 0..4) e.putFloat("adj$i", colorAdj[i])
+                e.apply()
+            }
+
+            // ---------------- 按键 / 退出 ----------------
+
+            private fun sendKey(code: Int) {
+                val id = displayId; val s = ServiceClient.service ?: return
+                if (id >= 0) thread { try { s.injectKey(id, code) } catch (_: Throwable) {} }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onBackPressed() = sendKey(KeyEvent.KEYCODE_BACK)
+
+            private fun stopAndExit() {
+                val s = ServiceClient.service
+                thread {
+                    try { s?.releaseDisplay() } catch (_: Throwable) {}
+                    runOnUiThread { finish() }
+                }
+            }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                try { dm?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
+                if (isFinishing) {
+                    val s = ServiceClient.service
+                    thread { try { s?.releaseDisplay() } catch (_: Throwable) {} }
+                }
+            }
+         }
+        STRETCH_EOF
+                cat > 'StretchBox/app/src/main/java/com/example/stretchbox/StretchActivity.kt' <<'STRETCH_EOF'
+        package com.example.stretchbox
+
+        import android.app.Activity
+        import android.app.AlertDialog
+        import android.content.Context
+        import android.graphics.Color
+        import android.graphics.Point
+        import android.hardware.display.DisplayManager
+        import android.opengl.GLSurfaceView
+        import android.os.Bundle
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.InputDevice
+        import android.view.KeyEvent
+        import android.view.MotionEvent
+        import android.view.Surface
+        import android.view.View
+        import android.view.ViewGroup
+        import android.view.WindowInsets
+        import android.view.WindowManager
+        import android.widget.AdapterView
+        import android.widget.ArrayAdapter
+        import android.widget.FrameLayout
+        import android.widget.LinearLayout
+        import android.widget.ScrollView
+        import android.widget.SeekBar
+        import android.widget.Spinner
+        import android.widget.TextView
+        import android.widget.Toast
+        import kotlin.concurrent.thread
+        import kotlin.math.roundToInt
+
+        /**
+         * 容器界面：
+         *  - GLSurfaceView 铺满全屏，用 OpenGL 把虚拟屏画面画出来（缓冲区比例 ≠ 屏幕比例 ⇒ 强制拉伸）
+         *  - GL 渲染支持明度/对比度/饱和度/色温和滤镜
+         *  - 触摸按 虚拟屏尺寸 / 控件尺寸 缩放后注入虚拟屏
+         */
+        class StretchActivity : Activity() {
+
+            companion object {
+                const val EXTRA_PKG = "pkg"
+                const val EXTRA_W = "w"
+                const val EXTRA_H = "h"
+                const val EXTRA_DPI = "dpi"
+                const val EXTRA_HZ = "hz"
+                const val EXTRA_FORCE_STOP = "force"
+                const val EXTRA_SHOW_MENU = "showMenu"
+                const val EXTRA_GYRO_FIX = "gyroFix"
+            }
+
+            private lateinit var glView: GLSurfaceView
+            private lateinit var renderer: StretchRenderer
+            private lateinit var pkg: String
+            private var vdW = 1920
+            private var vdH = 1080
+            private var dpi = 420
+            private var hz = 0
+            private var forceStop = true
+            private var showMenuBtn = true
+            private var gyroFix = false
+            private var flipV = false
+            private var flipH = false
+
+            /** 虚拟屏当前的逻辑尺寸（陀螺仪修复模式下以它为准） */
+            @Volatile private var logicalW = 0
+            @Volatile private var logicalH = 0
+            private var gyroLog = ""
+            private var gyroInvert = false
+            private var lastVdRot = -1
+            private var dm: DisplayManager? = null
+            private val displayListener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(id: Int) {}
+                override fun onDisplayRemoved(id: Int) {}
+                override fun onDisplayChanged(id: Int) {
+                    if (id == displayId) syncDisplayState()
+                    else if (gyroFix && id == (display?.displayId ?: -1)) applyVdRotation()   // 真屏转向时，虚拟屏跟着转
+                }
+            }
+
+            @Volatile private var displayId = -1
+            private var launched = false
+            private var outputSurface: Surface? = null
+
+            /** 明度/对比度/饱和度/色温，范围 -1..1；第 5 项是锐化，范围 0..1 */
+            private val colorAdj = floatArrayOf(0f, 0f, 0f, 0f, 0f)
+
+            private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                pkg = intent.getStringExtra(EXTRA_PKG) ?: run { finish(); return }
+                vdW = intent.getIntExtra(EXTRA_W, vdW)
+                vdH = intent.getIntExtra(EXTRA_H, vdH)
+                dpi = intent.getIntExtra(EXTRA_DPI, dpi)
+                hz = intent.getIntExtra(EXTRA_HZ, 0)
+                forceStop = intent.getBooleanExtra(EXTRA_FORCE_STOP, true)
+                showMenuBtn = false
+                gyroFix = intent.getBooleanExtra(EXTRA_GYRO_FIX, false)
+
+                for (i in 0..4) colorAdj[i] = prefs.getFloat("adj$i", 0f)
+                flipV = prefs.getBoolean("flipV", false)
+                flipH = prefs.getBoolean("flipH", false)
+                gyroInvert = prefs.getBoolean("gyroInvert", false)
+
+                goImmersive()
+
+                renderer = StretchRenderer(if (gyroFix) vdH else vdW, if (gyroFix) vdW else vdH) { s -> onOutputSurfaceReady(s) }
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                renderer.setFlip(flipH, flipV)
+                glView = GLSurfaceView(this).apply {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                    setOnTouchListener { v, ev -> forwardTouch(v, ev); true }
+                }
+                renderer.setView(glView)
+
+                val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                root.addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                if (showMenuBtn) {
+                    val d = resources.displayMetrics.density
+                    val menu = TextView(this).apply {
+                        text = "⋮"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                        setBackgroundColor(0x55000000); alpha = 0.5f
+                        setOnClickListener { showMenu() }
+                    }
+                    root.addView(menu, FrameLayout.LayoutParams((40 * d).roundToInt(), (40 * d).roundToInt(),
+                        Gravity.TOP or Gravity.END).apply {
+                        topMargin = (8 * d).roundToInt(); rightMargin = (8 * d).roundToInt()
+                    })
+                }
+
+                setContentView(root)
+                ServiceClient.bind(this)
+            }
+
+            private fun goImmersive() {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    val cur = display?.mode
+                    val best = display?.supportedModes
+                        ?.filter { cur != null && it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                        ?.maxByOrNull { it.refreshRate }
+                    if (best != null) preferredDisplayModeId = best.modeId
+                }
+                window.setDecorFitsSystemWindows(false)
+                window.decorView.windowInsetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+
+            // ---------------- 虚拟屏生命周期 ----------------
+
+            private fun onOutputSurfaceReady(s: Surface) {
+                outputSurface = s
+                ServiceClient.whenReady { svc ->
+                    thread {
+                        try {
+                            val maxHz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 0f
+                            val t0 = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - t0 < 3000 && (display?.refreshRate ?: 0f) < maxHz - 1f) {
+                                Thread.sleep(100)
+                            }
+                            // 陀螺仪修复模式：竖屏创建虚拟屏，让游戏按 90° 补偿传感器
+                            val dispW: Int
+                            val dispH: Int
+                            if (gyroFix) { dispW = vdH; dispH = vdW } else { dispW = vdW; dispH = vdH }
+                            val first = !launched
+                            svc.configure(gyroFix)
+                            displayId = svc.createDisplay(dispW, dispH, dpi, hz.toFloat(), s)
+                            if (gyroFix) {
+                                // 虚拟屏旋转方向 = 真屏当前的横屏方向(1或3)，在启动游戏之前设置
+                                val rot = desiredVdRotation()
+                                lastVdRot = rot
+                                val rr = svc.setDisplayRotation(displayId, rot)
+                                if (first) gyroLog = rr
+                                runOnUiThread { startDisplayWatch() }
+                            }
+                            if (!launched) {
+                                launched = true
+                                val out = svc.launch(pkg, displayId, forceStop)
+                                if (out.contains("Error", true) || out.startsWith("ERR") || out.startsWith("找不到"))
+                                    runOnUiThread { Toast.makeText(this, out, Toast.LENGTH_LONG).show() }
+                            }
+                                                        if (gyroFix && first && prefs.getBoolean("gyroDiag", true)) {
+                                Thread.sleep(2500)
+                                runOnUiThread { showGyroDiag() }
+                            }
+                        } catch (t: Throwable) {
+                            runOnUiThread { Toast.makeText(this, "创建虚拟屏失败: ${t.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+            }
+
+            override fun onResume() {
+                super.onResume()
+                glView.onResume()   // GL 重建后会再给一个新 Surface，自动重新 attach
+                
+                val s = outputSurface
+                if (s != null && displayId >= 0) {
+                    thread { try { ServiceClient.service?.setSurface(s) } catch (_: Throwable) {} }
+                    glView.requestRender()
+                }
+            }
+                        override fun onPause() {
+                // 退到后台：只暂停输出，虚拟屏和游戏继续存活
+                thread { try { ServiceClient.service?.setSurface(null) } catch (_: Throwable) {} }
+                glView.onPause()
+                super.onPause()
+            }
+
+            // ---------------- 触摸转发 ----------------
+
+            private fun forwardTouch(v: View, ev: MotionEvent) {
+                  
+                val svc = ServiceClient.service ?: return
+                val id = displayId
+                if (id < 0 || v.width == 0 || v.height == 0) return
+
+                val lw = if (gyroFix && logicalW > 0) logicalW else vdW
+                val lh = if (gyroFix && logicalH > 0) logicalH else vdH
+                val sx = lw.toFloat() / v.width
+                val sy = lh.toFloat() / v.height
+                val n = ev.pointerCount
+                val props = Array(n) { i -> MotionEvent.PointerProperties().also { ev.getPointerProperties(i, it) } }
+                val coords = Array(n) { i ->
+                    MotionEvent.PointerCoords().also {
+                        ev.getPointerCoords(i, it)
+                        it.x = (if (flipH) v.width - it.x else it.x) * sx
+                        it.y = (if (flipV) v.height - it.y else it.y) * sy
+                    }
+                }
+                val out = MotionEvent.obtain(
+                    ev.downTime, ev.eventTime, ev.action, n, props, coords,
+                    ev.metaState, ev.buttonState, 1f, 1f, ev.deviceId, ev.edgeFlags,
+                    InputDevice.SOURCE_TOUCHSCREEN, ev.flags
+                )
+                try { svc.injectTouch(id, out) } catch (_: Throwable) {} finally { out.recycle() }
+            }
+
+            // ---------------- 菜单 / 画面调节 ----------------
+
+            private fun showMenu() {
+                val labels = ArrayList<String>()
+                val actions = ArrayList<() -> Unit>()
+                fun add(label: String, action: () -> Unit) { labels.add(label); actions.add(action) }
+                add("画面调节（明度/对比度/滤镜/锐化）") { showColorDialog() }
+                add("上下翻转画面：" + (if (flipV) "开" else "关")) { flipV = !flipV; applyFlip() }
+                add("左右翻转画面：" + (if (flipH) "开" else "关")) { flipH = !flipH; applyFlip() }
+                if (gyroFix) {
+                                    add("查看陀螺仪诊断信息") { showGyroDiag() }
+                    add("陀螺仪方向反转：" + (if (gyroInvert) "开" else "关") + "（视角方向反了就点这里）") {
+                        gyroInvert = !gyroInvert
+                        prefs.edit().putBoolean("gyroInvert", gyroInvert).apply()
+                        applyVdRotation()
+                    }
+                }
+                add("发送返回键") { sendKey(KeyEvent.KEYCODE_BACK) }
+                add("停止并退出") { stopAndExit() }
+                AlertDialog.Builder(this)
+                    .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+                    .show()
+            }
+
+            private fun applyFlip() {
+                renderer.setFlip(flipH, flipV)
+                glView.requestRender()
+                prefs.edit().putBoolean("flipV", flipV).putBoolean("flipH", flipH).apply()
+            }
+
+            // ---------------- 陀螺仪修复：跟踪虚拟屏旋转 ----------------
+
+            private fun startDisplayWatch() {
+                if (dm == null) {
+                    dm = getSystemService(DisplayManager::class.java)
+                    dm?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+                }
+                syncDisplayState()
+            }
+
+            @Suppress("DEPRECATION")
+            private fun syncDisplayState() {
+                val d = dm?.getDisplay(displayId) ?: return
+                val p = Point()
+                d.getRealSize(p)
+                logicalW = p.x
+                logicalH = p.y
+                if (gyroFix) {
+                    renderer.setRotation(d.rotation)
+                    glView.requestRender()
+                }
+            }
+
+            /** 虚拟屏应锁定的旋转方向：跟随真屏的横屏方向(1或3)，可手动反转 */
+            private fun desiredVdRotation(): Int {
+                val r = display?.rotation ?: 1
+                val base = if (r == 1 || r == 3) r else 1
+                return if (gyroInvert) 4 - base else base
+            }
+
+            private fun applyVdRotation() {
+                val id = displayId
+                val s = ServiceClient.service ?: return
+                if (id < 0 || !gyroFix) return
+                val rot = desiredVdRotation()
+                if (rot == lastVdRot) return
+                lastVdRot = rot
+                thread { try { s.setDisplayRotation(id, rot) } catch (_: Throwable) {} }
+            }
+
+            private fun showGyroDiag() {
+                syncDisplayState()
+                val d = dm?.getDisplay(displayId)
+                val msg = "真屏旋转 = ${display?.rotation}\n" +
+                    "虚拟屏旋转 = ${d?.rotation}（应为 1 或 3，且与真屏一致）\n" +
+                    "逻辑尺寸 = ${logicalW}x${logicalH}\n" +
+                    "锁定旋转命令输出：${if (gyroLog.isEmpty()) "（无输出=成功）" else gyroLog}"
+                AlertDialog.Builder(this).setTitle("陀螺仪修复诊断").setMessage(msg)
+                    .setPositiveButton("确定", null).show()
+            }
+
+            private fun showColorDialog() {
+                val names = arrayOf("明度", "对比度", "饱和度", "色温")
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(40, 20, 40, 0)
+                }
+                val seeks = Array(4) { i ->
+                    SeekBar(this).apply {
+                        max = 200
+                        progress = ((colorAdj[i] + 1f) * 100).roundToInt()
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                                colorAdj[i] = p / 100f - 1f
+                                applyColors()
+                            }
+                            override fun onStartTrackingTouch(sb: SeekBar?) {}
+                            override fun onStopTrackingTouch(sb: SeekBar?) {}
+                        })
+                    }
+                }
+                for (i in 0..3) {
+                    root.addView(TextView(this).apply { text = names[i] })
+                    root.addView(seeks[i])
+                }
+
+                root.addView(TextView(this).apply { text = "锐化（画面发糊时往右拉）" })
+                root.addView(SeekBar(this).apply {
+                    max = 100
+                    progress = (colorAdj[4] * 100).roundToInt()
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                            colorAdj[4] = p / 100f
+                            applyColors()
+                        }
+                        override fun onStartTrackingTouch(sb: SeekBar?) {}
+                        override fun onStopTrackingTouch(sb: SeekBar?) {}
+                    })
+                })
+
+                val filters = listOf("无", "夜间护眼", "冷色调", "黑白", "鲜艳")
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
+                var initial = true   // Spinner 刚显示时会自动回调一次，必须跳过，否则会把已保存的调节清零
+                sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                        if (initial) { initial = false; return }
+                        val preset = when (pos) {
+                            1 -> floatArrayOf(-0.08f, 0f, -0.1f, 0.8f)
+                            2 -> floatArrayOf(0f, 0f, 0f, -0.6f)
+                            3 -> floatArrayOf(0f, 0f, -1f, 0f)
+                            4 -> floatArrayOf(0f, 0.1f, 0.4f, 0f)
+                            else -> floatArrayOf(0f, 0f, 0f, 0f)
+                        }
+                        for (i in 0..3) {
+                            colorAdj[i] = preset[i]
+                            seeks[i].progress = ((preset[i] + 1f) * 100).roundToInt()
+                        }
+                        applyColors()
+                    }
+                    override fun onNothingSelected(p: AdapterView<*>?) {}
+                }
+                root.addView(TextView(this).apply { text = "滤镜" })
+                root.addView(sp)
+
+                AlertDialog.Builder(this)
+                    .setTitle("画面调节")
+                    .setView(ScrollView(this).apply { addView(root) })
+                    .setPositiveButton("完成") { _, _ -> saveColors() }
+                    .show()
+            }
+
+            private fun applyColors() {
+                renderer.setColors(colorAdj[0], colorAdj[1], colorAdj[2], colorAdj[3])
+                renderer.setSharpness(colorAdj[4])
+                glView.requestRender()
+            }
+
+            private fun saveColors() {
+                val e = prefs.edit()
+                for (i in 0..4) e.putFloat("adj$i", colorAdj[i])
+                e.apply()
+            }
+
+            // ---------------- 按键 / 退出 ----------------
+
+            private fun sendKey(code: Int) {
+                val id = displayId; val s = ServiceClient.service ?: return
+                if (id >= 0) thread { try { s.injectKey(id, code) } catch (_: Throwable) {} }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onBackPressed() = sendKey(KeyEvent.KEYCODE_BACK)
+
+            private fun stopAndExit() {
+                val s = ServiceClient.service
+                thread {
+                    try { s?.releaseDisplay() } catch (_: Throwable) {}
+                    runOnUiThread { finish() }
+                }
+            }
+
+            override fun onDestroy() {
+                super.onDestroy()
+                try { dm?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
+                if (isFinishing) {
+                    val s = ServiceClient.service
+                    thread { try { s?.releaseDisplay() } catch (_: Throwable) {} }
+                }
+            }
+        }
+        STRETCH_EOF
+        mkdir -p StretchBox/app/src/main/res/drawable
+        if [ -f icon.png ]; then
+          cp icon.png StretchBox/app/src/main/res/drawable/icon.png
+        else
+          echo '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' | base64 -d > StretchBox/app/src/main/res/drawable/icon.png
+        fi
+    - uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: 8.7
+    - name: Build
+      working-directory: StretchBox
+      run: gradle assembleDebug --no-daemon
+    - uses: actions/upload-artifact@v4
+      with:
+        name: StretchBox-apk
+        path: StretchBox/app/build/outputs/apk/debug/app-debug.apk
